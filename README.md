@@ -8,8 +8,8 @@ dry spells"* (Doizé, Allard, Naveau, Wintenberger).
 
 Finite-order Markov chains are the workhorse of rainfall-occurrence
 modelling, but they impose a *geometric* tail on spell durations. In
-climates with long dry spells — most of the Mediterranean domain studied
-here — this systematically under-predicts severe drought (see
+climates with long dry spells, most of the Mediterranean domain studied
+here this systematically under-predicts severe drought (see
 Fig. 2 of the article, Palermo-spring).
 
 The article introduces a **Binary Markov Chain with Duration (BMCD)** on
@@ -21,10 +21,10 @@ law, so the model class is as expressive as the choice of that law.
 The article then picks two such laws from the extended Generalized Pareto
 Distribution (eGPD) family:
 
-- **Dry spells** — a hurdle-discretised eGPD (**hdeGPD**, Eq. 3), fit by
+- **Dry spells**, a hurdle-discretised eGPD (**hdeGPD**, Eq. 3), fit by
   Probability Weighted Moments. The shape parameter $\xi$ ranges from
   bounded to heavy-tailed across stations and seasons.
-- **Wet spells** — a two-component geometric mixture (Eq. 5), fit by EM.
+- **Wet spells**, a two-component geometric mixture (Eq. 5), fit by EM.
 
 Two headline findings motivate the provided tooling:
 
@@ -33,7 +33,7 @@ Two headline findings motivate the provided tooling:
   many** southern-European stations as hdeGPD.
 - At 40- and 60-day thresholds, the **mean residual dry-spell duration**
   along the Mediterranean coast is materially larger under hdeGPD than
-  under the geometric model — a concrete revision of drought exposure.
+  under the geometric model, a concrete revision of drought exposure.
 
 Definitions, proofs, and proposition/equation numbers cited throughout
 the code match the article's LaTeX source (`main-oup-template.tex`).
@@ -44,7 +44,7 @@ Thin, notebook-driven layer that regenerates every figure. All paths live
 in [config.py](config.py). The numerical core (ECAD loading, hdeGPD
 cdf/pmf, wet-spell EM mixture, empirical exit probabilities, chi-squared
 GOF test) is **imported from [../rainfall_article_clean/](../rainfall_article_clean/)**
-to avoid duplication — see [_legacy.py](_legacy.py). The modules below
+to avoid duplication, see [_legacy.py](_legacy.py). The modules below
 are thin re-export facades.
 
 ### Modules
@@ -62,7 +62,7 @@ are thin re-export facades.
 
 | # | File | Figures produced |
 |---|---|---|
-| 01 | [notebooks/01_prepare_data.ipynb](notebooks/01_prepare_data.ipynb) | (data only — JSON export) |
+| 01 | [notebooks/01_prepare_data.ipynb](notebooks/01_prepare_data.ipynb) | (data only, JSON export) |
 | 02 | [notebooks/02_toy_and_map.ipynb](notebooks/02_toy_and_map.ipynb) | `map_palermo.pdf`, `PALERMO_comparison_dry_spell_egpd_geom_4seasons.pdf`, `toy_data_fig_with_N.pdf` |
 | 03 | [notebooks/03_fit_and_params.ipynb](notebooks/03_fit_and_params.ipynb) | `histogram_dry_spell_distrib_params.pdf`, `histogram_wet_spell_distrib_params.pdf` |
 | 04 | [notebooks/04_palermo_diagnostics.ipynb](notebooks/04_palermo_diagnostics.ipynb) | `PALERMO_{bivariate_acf,histogram_dry,histogram_wet,qqplot_dry,qqplot_wet,proba_leaving_state}.pdf` |
@@ -90,7 +90,7 @@ download is needed. If `ECAD_RAW_DIR` moves, update [config.py](config.py).
   Without refitting, the committed CSVs in
   `R_files/fit_europe_spells_1945_threshold_JSON_ext_gpd/thr_6/` are used.
 - The wet-spell mixture (Eq. 5 in the article) is fit in Python directly
-  from the JSON exports — no R step needed.
+  from the JSON exports, no R step needed.
 - The Palermo station is resolved by name in [config.py](config.py)
   (`PALERMO_NAME = "PALERMO"`); adapt to run the diagnostics on another
   city.
@@ -98,7 +98,7 @@ download is needed. If `ECAD_RAW_DIR` moves, update [config.py](config.py).
 ## Applying the model to your own data
 
 The BMCD / hdeGPD machinery in this package is not ECAD-specific. To fit
-it to another rainfall record, follow the seven steps below — every
+it to another rainfall record, follow the seven steps below, every
 function cited already lives in the modules above.
 
 ### 1. Shape your data
@@ -115,9 +115,9 @@ unless you have a reason to deviate.
 From a tidy dataframe of daily precipitation with dates, use
 [data_load.py](data_load.py):
 
-- `process_and_extract_excursions_from_raw_input_df_with_dates(df)` —
+- `process_and_extract_excursions_from_raw_input_df_with_dates(df)`,
   segment into wet/dry spells,
-- `from_concat_with_dates_to_concat_by_season(...)` — split by season,
+- `from_concat_with_dates_to_concat_by_season(...)`, split by season,
 - or the lower-level `extract_longer_dry_spells_w_dates_list_df` if you
   only need dry spells.
 
@@ -150,15 +150,15 @@ $$q^{(r)}_d = \mathbb P_{\hat\theta}(\tau^{(r)} = d) / \mathbb P_{\hat\theta}(\t
 
 ### 5. Validate the fit
 
-- **Independence of successive spells (Appendix E)** —
+- **Independence of successive spells (Appendix E)**,
   `pooled_bivariate_autocorr` in [statistics.py](statistics.py).
-- **Tail agreement** — simulation-based Q-Q plot, with
+- **Tail agreement**, simulation-based Q-Q plot, with
   `simulate_season_durations_from_fit` for the fitted-model sample.
-- **Exit-probability curve** — empirical
+- **Exit-probability curve**, empirical
   $\hat q^{(r)}_{d,\mathrm{emp}}$ via `get_proba_leaving_by_day`
   ([statistics.py](statistics.py)) against the model-implied
   $\hat q^{(r)}_{d,\hat\theta}$ from the cdf factory.
-- **Chi-squared GOF test (Proposition 4)** —
+- **Chi-squared GOF test (Proposition 4)**,
   `goodness_of_fit_for_city_season` and
   `goodness_of_fit_for_sample_geometric` in [gof.py](gof.py). Use
   `adaptive_D` to pick `d_max` so at least 20 spells exceed it (the
@@ -168,11 +168,11 @@ $$q^{(r)}_d = \mathbb P_{\hat\theta}(\tau^{(r)} = d) / \mathbb P_{\hat\theta}(\t
 
 - Sample paths: `simulate_season_durations_from_fit` and
   `rvs_duration_from_fitted_extgpd` from [spell_models.py](spell_models.py).
-- **Mean residual dry-spell duration (Appendix H)** —
+- **Mean residual dry-spell duration (Appendix H)**,
   `compute_bounds_refined` in [statistics.py](statistics.py). The bounds
   of Eq. H.3 give an arbitrarily tight approximation as the cut-off $u$
   grows.
-- **Proportion of time in long dry spells (Example 1, Appendix I)** —
+- **Proportion of time in long dry spells (Example 1, Appendix I)**,
   `make_approx_share_dry_days_longer_dthresh` and the closed-form
   geometric baseline `share_dry_days_longer_dthresh_markov_order_1_approx`
   in [statistics.py](statistics.py).
@@ -183,5 +183,5 @@ In most cases only [config.py](config.py): `ECAD_RAW_DIR`,
 `STATION_METADATA_CSV`, `SEASONS`, `DEFAULT_THRESHOLD`, and `PALERMO_NAME`
 (→ your reference station). The notebooks assume ECA\&D-style inputs;
 adapting to another source usually means rewriting
-[notebooks/01_prepare_data.ipynb](notebooks/01_prepare_data.ipynb) only —
+[notebooks/01_prepare_data.ipynb](notebooks/01_prepare_data.ipynb) only,
 downstream notebooks consume the JSON export it produces.
