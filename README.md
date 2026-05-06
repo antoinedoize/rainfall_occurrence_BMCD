@@ -1,4 +1,4 @@
-# Companion code — A duration-augmented binary Markov chain for rainfall occurrence with long dry spells
+# A duration-augmented binary Markov chain for rainfall occurrence with long dry spells
 
 Reproduction pipeline and re-usable implementation for the article
 *"A duration-augmented binary Markov chain for rainfall occurrence with long
