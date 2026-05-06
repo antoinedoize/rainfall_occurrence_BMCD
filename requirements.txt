@@ -1,9 +1,16 @@
-numpy
-scipy
-pandas
-matplotlib
-plotly
-tqdm
-mplcursors
-jupyter
-kaleido
+# Tested with Python 3.14 in the bmcd_rainfall conda env.
+# Pins use ~= (compatible release): patch updates allowed, minor/major bumps blocked.
+# To recreate the env:
+#   conda create -n bmcd_rainfall python=3.14 pip -y
+#   conda activate bmcd_rainfall
+#   pip install -r requirements.txt
+
+numpy~=2.4
+scipy~=1.17
+pandas~=3.0
+matplotlib~=3.10
+plotly~=6.7
+tqdm~=4.67
+mplcursors~=0.7
+jupyter~=1.1
+kaleido~=1.2

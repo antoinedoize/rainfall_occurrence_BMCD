@@ -232,7 +232,7 @@ def fit_hdegpd_dry_spell_durations(
         data_json = json.load(f)
     df_names = sorted(data_json.keys()) if subset_city_to_fit is False else sorted(subset_city_to_fit)
     results_rows = []
-    for df_name in tqdm(df_names, desc=f"{"dry_spell"}"):
+    for df_name in tqdm(df_names, desc=f"dry_spell"):
         durations, months = get_dry_spells_from_json(data_json, df_name)
         for vec_month_seasons in LIST_MONTH_SEASONS:
             season_label = vec_month_seasons[3]

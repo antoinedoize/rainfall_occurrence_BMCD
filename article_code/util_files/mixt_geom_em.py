@@ -79,7 +79,7 @@ def fit_mixt_geom_wet_spell_durations(json_path,
         data = json.load(f)
     list_cities = sorted(data.keys()) if subset_city_to_fit is False else sorted(subset_city_to_fit)
     results_rows = []
-    for city in tqdm(list_cities, desc=f"{"wet_spell"}"):
+    for city in tqdm(list_cities, desc=f"wet_spell"):
         node = data[city]["wet_spell"]
         durations   = np.asarray(node["duration_spell"], dtype=float)
         start_dates = np.asarray(node["start_date_spell"], dtype=str)

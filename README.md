@@ -78,7 +78,7 @@ Python ≥ 3.10 is required (the codebase uses PEP 604 union syntax).
 ### Conda (preferred)
 
 ```bash
-conda create -n bmcd_rainfall python pip -y
+conda create -n bmcd_rainfall python=3.14 pip -y
 conda activate bmcd_rainfall
 pip install -r requirements.txt
 ```
@@ -95,14 +95,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` pulls `numpy, scipy, pandas, matplotlib, plotly, tqdm,
-mplcursors, jupyter, kaleido`.
-
-For image saving you may need to upgrade the kaleido package:
-
-```bash
-pip install --upgrade kaleido
-```
+`requirements.txt` pins `numpy, scipy, pandas, matplotlib, plotly, tqdm,
+mplcursors, jupyter, kaleido` to compatible-release ranges (`~=major.minor`)
+matching the `bmcd_rainfall` env used to produce the article (Python 3.14).
+Installing on a different Python minor or with looser pins may produce
+slightly different numerical results.
 
 ### LaTeX (default; optional)
 
