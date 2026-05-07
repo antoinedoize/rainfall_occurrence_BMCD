@@ -73,7 +73,7 @@ companion_code_article/
 
 ## Installation
 
-Python ≥ 3.10 is required (the codebase uses PEP 604 union syntax).
+Python ≥ 3.12 is required (the codebase uses PEP 604 union syntax).
 
 ### Conda (preferred)
 
