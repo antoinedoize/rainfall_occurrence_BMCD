@@ -1,0 +1,9 @@
+
+implementation de :
+2020 Tsay, Wen-Jen (author);Ke, Peng-Hsuan (author)A simple approximation for the bivariate normal integral
+
+
+deja codée en C++ dans
+https://github.com/david-cortes/approxcdf/blob/master/src/other.cpp
+traduction de 
+approxcdf.bvn_cdf → norm_cdf_2d_vfast (src/other.cpp

@@ -1,0 +1,3 @@
+[submodule "spatial_bmcd/Spatialisation-Rain-Occurrence-Generator-article"]
+	path = spatial_bmcd/Spatialisation-Rain-Occurrence-Generator-article
+	url = https://github.com/antoinedoize/Spatialisation-Rain-Occurrence-Generator-article.git
