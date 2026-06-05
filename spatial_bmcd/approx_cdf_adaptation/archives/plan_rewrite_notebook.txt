@@ -1,0 +1,150 @@
+# Refocus `util_speedup_approx_cdf.ipynb` on understanding the Tsay–Ke `approx_cdf` method
+
+## Context
+
+The notebook [util_speedup_approx_cdf.ipynb](spatial_bmcd/approx_cdf_adaptation/util_speedup_approx_cdf.ipynb)
+currently does three things at once: (1) ports the `approxcdf` (Tsay–Ke 2021)
+bivariate-normal CDF approximation to NumPy, (2) discusses installing the
+compiled `approxcdf` C package from GitHub, and (3) benchmarks speed + a full
+pairwise-MLE. The result is dense and hard to follow, the **kernel is an
+unreadable bit-faithful C++ transcription** (4 cryptic sign-branches, names like
+`a_sq_c1`, `twicea_s`), and — importantly — the **accuracy check is silently
+broken**: in cell `63b9cd4b` the error lines are commented out, so it reports a
+fake `max |Δ| = 0.000e+00` and its asserts pass trivially.
+
+The user wants a **global-but-precise understanding of the rewriting** (the
+ported approximation, *not* the GitHub/compiled-package path, which is to be
+removed), and a notebook that first **explains what the method does** and then
+**checks it works with simple, understandable methods**.
+
+Goal: restructure the notebook into **two parts** —
+**Part 1: Understand + Verify**, **Part 2: Speed + MLE check** — add a **readable
+teaching implementation** of the kernel, verify correctness **against scipy
+ground truth only**, remove all compiled-package / packaging material, and fix
+the broken accuracy check.
+
+## The method, stated precisely (drives the explanation cells)
+
+The hot spot of the pairwise composite likelihood is the standardized bivariate
+normal CDF `q_joint = Φ₂(z1, z2; ρ)`, computed today by
+[`phi2`](spatial_bmcd/spatial_model.py#L405-L409) (a fresh
+`scipy.stats.multivariate_normal` per call) inside the scalar `for j,k` loop of
+[`pairwise_loglik_one_step_nanaware`](spatial_bmcd/spatial_model.py#L412-L460).
+
+The method rests on the exact 1-D integral identity
+
+```
+Φ₂(x1, x2; ρ) = ∫_{-∞}^{x2} φ(s) · Φ(a·s + b) ds,   a = -ρ/√(1-ρ²),  b = x1/√(1-ρ²)
+```
+
+which is exactly what the code's `a`, `b`, and `aq = a·x2 + b` encode (`aq` is
+the inner-Φ argument at the upper limit). **Tsay–Ke's one trick:** replace the
+inner univariate Φ, on each side of its zero, by a `½·exp(quadratic)`
+tail-shaped function with **two fitted constants** `c1 = -1.0950081470333`,
+`c2 = -0.75651138383854`. Then `φ(s)·(approx)` is `exp(quadratic in s)`, so the
+integral collapses to a **closed-form `erf` expression**. The **4 sign branches**
+are pure bookkeeping: `a > 0 / a ≤ 0` orients the line, and the split at
+`s* = -b/a` (sign of `aq`) selects which side's tail form applies. Cost: a
+branch-free `erf` formula, error ≈10⁻³ vs exact, and — being closed-form in ρ —
+it **vectorises over per-pair ρ**.
+
+## Target notebook structure
+
+### PART 1 — Understand + Verify (the focus)
+
+1. **(md) Title + what/why** — rewrite the intro (cell `d749a0dc`): the Φ₂ hot
+   spot in the pairwise likelihood and the goal of a fast approximation. **Delete**
+   the "Why we port it instead of pip install-ing it" paragraph, the MSVC/compiler
+   discussion, and the C-extension column/row of the table.
+2. **(code) Imports** — keep the repo-root/`sys.path` bootstrap and scipy imports
+   from cell `3f2cfd29`; **delete** the commented-out `import approxcdf` /
+   `HAVE_APPROXCDF` block. No new imports (scipy.stats is the only reference;
+   keep matplotlib for one small error plot).
+3. **(md) The method in one idea** — the integral identity + "approximate inner Φ
+   by a ½·exp(quadratic) tail (constants c1,c2) → closed-form erf; 4 cases = which
+   side of the split `s*=-b/a`." Global but precise; no full derivation.
+4. **(code) Readable teaching kernel** `bvn_teaching(x1, x2, rho)` — a clean,
+   commented **scalar** re-expression of the same approximation: clear names
+   (`split_point`, inner-arg, etc.), a single shared helper for the recurring
+   "Gaussian × exp-quadratic integrated to erf" term, and comments mapping each
+   block to the integral and the sign split. Faithful by construction (it is the
+   port's algebra reorganised), so it matches the fast port to ≈10⁻¹² and scipy
+   to ≈10⁻³. *(Stretch, include only if it plots cleanly vs `norm.cdf`: expose the
+   implied univariate inner approximation `phi_tsay_approx(u)` as the conceptual
+   centerpiece.)*
+5. **(md) The fast production port** — reframe cell `fbfdee59`: this is the
+   vectorised NumPy port of the same Tsay–Ke closed form (bit-faithful to
+   `approxcdf`'s C kernel `norm_cdf_2d_vfast`); the teaching version above explains
+   what it computes. **Delete** pip/compiler framing.
+6. **(code) Fast port** — keep `C1, C2`, `bvn_tsay_scalar`, `bvn_tsay`,
+   `phi2_approxcdf`, `phi2_approxcdf_vec` from cell `1c79d5a8` unchanged.
+7. **(md) Verify correctness vs scipy** — rewrite cell `6ff75184`.
+8. **(code) FIXED accuracy grid** — repair cell `63b9cd4b`: mesh
+   `x1,x2 ∈ [-3.5,3.5] × ρ ∈ {0,±0.3,±0.6,±0.9,±0.99,±0.999}`; **uncomment / build
+   the real error arrays** comparing **fast port vs scipy**, **teaching vs scipy**,
+   and **teaching vs port**; print max/mean |Δ|; keep an assert near the true level
+   (`max < 2e-3` for the approximation, `< 1e-9` for teaching-vs-port). Add one
+   small `matplotlib` plot of |error| across the grid.
+
+### PART 2 — Speed + MLE check (kept, cleaned)
+
+9. **(md) Part 2 intro** — now that it is correct, is it fast, and does it move σ̂?
+10. **(code) Per-call & batched speed** — keep cell `446f333f` (scipy vs approxcdf
+    scalar vs approxcdf vectorised); strip commented-out Genz lines.
+11. **(md+code) Loop-level pairwise loglik** — keep cells `9f49de6e` / `69edc756`;
+    strip Genz remnants.
+12. **(md+code) Full MLE** — keep cells `12141abd`, `6754a582`, `4ef6ad18`,
+    `c1170f81` (synthetic params via `make_synthetic_params` + `simulate_history`;
+    scipy baseline; `phi2` monkey-patch drop-in; batched `mle_vec`). Strip Genz
+    remnants. This is the end-to-end proof that σ̂ is essentially unchanged.
+13. **(md+code) Summary** — keep cells `69ca54af` / `f23f05be`, but base the error
+    bar on the **now-real** errors and remove the Genz series. Update the
+    **Conclusion** (cell `8c9a202a`) to keep the speed/accuracy takeaway and
+    **drop** the "add the compiled approxcdf package" recommendation.
+
+### Removals (the "github import method")
+
+- Commented `import approxcdf` / `HAVE_APPROXCDF` block in cell `3f2cfd29`.
+- The **Genz reference** cells `49d00cc4` (md) and `452a04fd` (`_bvnd`,
+  `phi2_genz`) — redundant clutter here; Genz lives in the sibling notebook
+  [util_speedup_approx_biv.ipynb](spatial_bmcd/util_speedup_approx_biv.ipynb).
+- The entire **packaging section** cell `35c26da9` ("How to integrate… pip
+  install git+…, optional C dependency").
+- C-extension framing inside the intro/conclusion/markdown.
+
+## Critical files
+
+- **Edit (only file changed):**
+  [spatial_bmcd/approx_cdf_adaptation/util_speedup_approx_cdf.ipynb](spatial_bmcd/approx_cdf_adaptation/util_speedup_approx_cdf.ipynb)
+  — via `NotebookEdit`, cell by cell per the structure above.
+- **Read-only references (do not modify):** `phi2` and
+  `pairwise_loglik_one_step_nanaware` in
+  [spatial_bmcd/spatial_model.py](spatial_bmcd/spatial_model.py#L405-L460);
+  `mle_sigma_pairwise`, `simulate_history`, `build_C_from_sigma` (imported by the
+  notebook).
+
+## Verification (how to test)
+
+1. **Run the notebook top-to-bottom** (Restart & Run All) — every cell must
+   execute with no commented-out asserts.
+2. **Part 1 correctness:** the fixed accuracy cell must print a *real*
+   `max |Δ| ≈ 5e-4–1e-3` for **port vs scipy** and **teaching vs scipy**, and
+   `≈1e-12` for **teaching vs port**; asserts pass at those levels (no more fake
+   `0.000e+00`).
+3. **Part 2 sanity:** MLE cells show `σ̂_approx ≈ σ̂_scipy` (|Δσ̂| ~1e-5 or
+   better) with a clear speedup; no references to Genz or the compiled package
+   remain anywhere in the notebook.
+4. Spot-check a few `(x1,x2,ρ)` triples: `bvn_teaching`, `bvn_tsay_scalar`, and
+   `phi2(scipy)` agree to ≈10⁻³.
+
+## Notes / risks
+
+- **Scope guardrail:** changes are confined to the one notebook; `spatial_model.py`
+  is *not* edited (the MLE drop-in stays a runtime monkey-patch, as today).
+- **Teaching version faithfulness:** built as a readable refactor of the port's
+  own algebra, so agreement with the port is guaranteed; the univariate
+  `phi_tsay_approx(u)` demo is included only if it illustrates cleanly vs
+  `norm.cdf` (the constants are fit for the *integral*, not pointwise, so it may
+  be shown as "good under the integral" rather than a tight pointwise match).
+- **References:** scipy `multivariate_normal.cdf` / `norm.cdf` are the sole ground
+  truth (no `quad`, no Monte Carlo), per the chosen approach.
