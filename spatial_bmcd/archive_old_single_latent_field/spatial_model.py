@@ -1,29 +1,8 @@
 """Spatial Binary Markov Chain with Duration (BMCD) — model, likelihood and I/O.
 
 Implements the spatial extension of the single-site BMCD described in
-``Spatialisation-Rain-Occurrence-Generator-article/main.tex``. Re-uses the
-single-site fits produced by
+``spatial_analysis_article.tex``. Re-uses the single-site fits produced by
 ``article_code/notebooks_article_pipeline/01_prepare_data_and_fit_distributions.ipynb``.
-
-This module implements the **direct Linear Model of Coregionalization (LMC)**
-construction (the ``\\new{}`` blue model in ``main.tex``): a bivariate centred
-Gaussian field ``(Z^(0), Z^(1))``, one component per spell type, built from three
-independent latent fields ``W^c, W^(0), W^(1)`` and a mixing weight ``lambda``,
-
-    Z^(r)(s) = (-1)^r * sqrt(lambda) * W^c(s) + sqrt(1-lambda) * W^(r)(s),
-
-selected by the current spell type, ``Z(s) = Z^(R(s))(s)`` (no sign flip). The
-model parameter is ``theta = (lambda, sigma_wc, sigma_w0, sigma_w1)`` and the
-state-dependent covariance blocks are
-
-    C^(0,0)(h) = lambda * rho_wc(h) + (1-lambda) * rho_w0(h),
-    C^(1,1)(h) = lambda * rho_wc(h) + (1-lambda) * rho_w1(h),
-    C^(0,1)(h) = -lambda * rho_wc(h),
-
-with exponential latent correlations ``rho_k(h) = exp(-h / sigma_k)``. It reduces
-to the original single-latent-field model when ``lambda = 1`` (then ``sigma_wc``
-plays the role of the old scalar range ``sigma``); that frozen single-field
-implementation is kept under ``archive_old_single_latent_field/``.
 """
 
 from __future__ import annotations
@@ -35,7 +14,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 import scipy.stats
-from scipy.optimize import minimize
+from scipy.optimize import minimize_scalar
 from scipy.special import erf
 from scipy.stats import multivariate_normal, norm
 from tqdm import tqdm
@@ -234,112 +213,29 @@ def build_C_from_sigma(
     )
 
 
-# ---------------------------------------------------------------------------
-# LMC parameter theta = (lambda, sigma_wc, sigma_w0, sigma_w1) and covariance
-# ---------------------------------------------------------------------------
-
-
-def normalize_theta(theta) -> Dict[str, float]:
-    """Coerce ``theta`` to a dict ``{lam, sigma_wc, sigma_w0, sigma_w1}``.
-
-    Accepts a mapping with those keys (``lam`` may also be spelled ``lambda``),
-    or a length-4 sequence ``(lam, sigma_wc, sigma_w0, sigma_w1)``.
-    """
-    if isinstance(theta, dict):
-        lam = theta.get("lam", theta.get("lambda"))
-        return {
-            "lam": float(lam),
-            "sigma_wc": float(theta["sigma_wc"]),
-            "sigma_w0": float(theta["sigma_w0"]),
-            "sigma_w1": float(theta["sigma_w1"]),
-        }
-    lam, s_wc, s_w0, s_w1 = theta
-    return {
-        "lam": float(lam),
-        "sigma_wc": float(s_wc),
-        "sigma_w0": float(s_w0),
-        "sigma_w1": float(s_w1),
-    }
-
-
-def build_field_cov_matrices(
-    station_names: Sequence[str],
+def step_spatial_markov(
+    R: np.ndarray,
+    D: np.ndarray,
+    C: np.ndarray,
     params_by_station: Dict[str, dict],
-    theta,
-) -> Dict[str, np.ndarray]:
-    """The three latent exponential correlation matrices ``rho_wc, rho_w0, rho_w1``.
+    rng: Optional[np.random.Generator] = None,
+    station_names: Optional[Sequence[str]] = None,
+    clip_q: float = 1e-12,
+):
+    """One step of the spatial Markov chain — see Eq. (3) of the article.
 
-    Each is the ``J x J`` matrix ``exp(-h / sigma_k)`` of the corresponding latent
-    field, reusing :func:`build_C_from_sigma`.
+    Returns ``(R_next, D_next, switch, q, z)``.
     """
-    th = normalize_theta(theta)
-    return {
-        "wc": build_C_from_sigma(station_names, params_by_station, th["sigma_wc"]),
-        "w0": build_C_from_sigma(station_names, params_by_station, th["sigma_w0"]),
-        "w1": build_C_from_sigma(station_names, params_by_station, th["sigma_w1"]),
-    }
-
-
-def build_lmc_blocks(
-    station_names: Sequence[str],
-    params_by_station: Dict[str, dict],
-    theta,
-) -> Dict[str, np.ndarray]:
-    """The LMC covariance blocks ``C^(0,0), C^(1,1), C^(0,1)`` — Eq. (lmc_blocks_direct).
-
-    Returns ``{"C00", "C11", "C01"}``, each a ``J x J`` matrix:
-
-        C00 = lambda * rho_wc + (1-lambda) * rho_w0,
-        C11 = lambda * rho_wc + (1-lambda) * rho_w1,
-        C01 = -lambda * rho_wc.
-
-    Diagonals of ``C00`` and ``C11`` are 1 (unit-variance sites). ``C01`` is the
-    negative dry-wet cross-block carrying the sign.
-    """
-    th = normalize_theta(theta)
-    lam = th["lam"]
-    rho = build_field_cov_matrices(station_names, params_by_station, th)
-    return {
-        "C00": lam * rho["wc"] + (1.0 - lam) * rho["w0"],
-        "C11": lam * rho["wc"] + (1.0 - lam) * rho["w1"],
-        "C01": -lam * rho["wc"],
-    }
-
-
-def build_state_selected_cov(blocks: Dict[str, np.ndarray], R: np.ndarray) -> np.ndarray:
-    """Assemble the state-selected covariance ``Sigma^(R)`` — Eq. (state_selected_cov).
-
-    Entry ``(j, j')`` is the LMC block selected by the spell types ``(R[j], R[j'])``:
-    ``C00`` for dry-dry, ``C11`` for wet-wet, ``C01`` otherwise. ``R`` is the 0/1
-    spell-type configuration; ``blocks`` comes from :func:`build_lmc_blocks`
-    (already restricted to the same station ordering as ``R``).
-    """
-    R = np.asarray(R).astype(int)
-    rj = R[:, None]
-    rk = R[None, :]
-    C00, C11, C01 = blocks["C00"], blocks["C11"], blocks["C01"]
-    return np.where(
-        (rj == 0) & (rk == 0), C00,
-        np.where((rj == 1) & (rk == 1), C11, C01),
-    )
-
-
-def _assemble_selected_field(R, lam, Wc, W0, W1):
-    """Assemble the state-selected latent variable ``Z = Z^(R)`` — Eq. (lmc_fields_direct).
-
-    ``Z^(r) = (-1)^r sqrt(lambda) Wc + sqrt(1-lambda) W^(r)``, then select the
-    component matching the current spell type ``R``. No further sign flip.
-    """
-    sqrt_lam = np.sqrt(lam)
-    sqrt_1ml = np.sqrt(1.0 - lam)
-    Z0 = sqrt_lam * Wc + sqrt_1ml * W0          # r = 0, (-1)^0 = +1
-    Z1 = -sqrt_lam * Wc + sqrt_1ml * W1         # r = 1, (-1)^1 = -1
-    return np.where(R == 0, Z0, Z1)
-
-
-def _exit_probs(R, D, params_by_station, station_names, clip_q):
-    """Per-station exit probabilities ``q`` and Gaussian thresholds ``z``."""
+    if station_names is None:
+        station_names = sorted(list(params_by_station.keys()))
     m = len(station_names)
+
+    if rng is not None:
+        Y = rng.multivariate_normal(mean=np.zeros(m), cov=C)
+    else:
+        Y = multivariate_normal(mean=np.zeros(m), cov=C).rvs()
+    Z = np.where(R == 0, Y, -Y)
+
     q = np.empty(m, dtype=float)
     for j, name in enumerate(station_names):
         f = params_by_station[name][
@@ -347,41 +243,7 @@ def _exit_probs(R, D, params_by_station, station_names, clip_q):
         ]
         q[j] = float(f(D[j]))
     q = np.clip(q, clip_q, 1.0 - clip_q)
-    return q, norm.ppf(q)
-
-
-def step_spatial_markov(
-    R: np.ndarray,
-    D: np.ndarray,
-    field_cov: Dict[str, np.ndarray],
-    lam: float,
-    params_by_station: Dict[str, dict],
-    rng: Optional[np.random.Generator] = None,
-    station_names: Optional[Sequence[str]] = None,
-    clip_q: float = 1e-12,
-):
-    """One step of the spatial LMC Markov chain — see Eq. (spatialized_markov) of main.tex.
-
-    Draws the three latent fields ``W^c, W^(0), W^(1)`` (each a centred Gaussian
-    with the corresponding exponential correlation in ``field_cov``), assembles the
-    state-selected variable ``Z`` and applies the switch/persist rule. The Gaussian
-    vectors are drawn with ``rng.multivariate_normal`` (SVD factorisation) — the
-    per-step ("svd") simulator. Returns ``(R_next, D_next, switch, q, z)``.
-    """
-    if station_names is None:
-        station_names = sorted(list(params_by_station.keys()))
-    m = len(station_names)
-    mean = np.zeros(m)
-
-    def _draw(C):
-        if rng is not None:
-            return rng.multivariate_normal(mean=mean, cov=C)
-        return multivariate_normal(mean=mean, cov=C).rvs()
-
-    Wc, W0, W1 = _draw(field_cov["wc"]), _draw(field_cov["w0"]), _draw(field_cov["w1"])
-    Z = _assemble_selected_field(R, lam, Wc, W0, W1)
-
-    q, z = _exit_probs(R, D, params_by_station, station_names, clip_q)
+    z = norm.ppf(q)
     switch = Z <= z
 
     R_next = R.copy()
@@ -393,7 +255,7 @@ def step_spatial_markov(
 
 
 def simulate_cholesky(
-    theta,
+    sigma: float,
     params_by_station: Dict[str, dict],
     n_steps: int,
     n_burn: int = 500,
@@ -404,41 +266,36 @@ def simulate_cholesky(
     clip_q: float = 1e-12,
     jitter: float = 0.0,
 ) -> dict:
-    """Simulate a spatial LMC-BMCD trajectory by Cholesky factorisation — Section 5 of main.tex.
+    """Simulate a spatial BMCD trajectory by Cholesky factorisation— algorithm of Section 5 of the article.
 
-    ``theta = (lambda, sigma_wc, sigma_w0, sigma_w1)`` (tuple or dict, see
-    :func:`normalize_theta`). Three steps, mirroring the article:
+    Three steps, mirroring the article:
 
-    1. **Spatial Cholesky factorisation** — build the three latent covariance
-       matrices ``Sigma_wc, Sigma_w0, Sigma_w1`` (exponential with ranges
-       ``sigma_wc, sigma_w0, sigma_w1``) on the rescaled stations and factor each
-       ``Sigma_k = L_k L_k^T`` once. ``jitter`` defaults to ``0``; set a small
-       positive value (e.g. ``1e-6``) to stabilise near-singular factorisations.
-    2. **Initialisation + burn-in** — if ``R0`` / ``D0`` are not provided, start
-       deterministically all-dry (``R0[j] = 0``, ``D0[j] = 1``), then run
-       ``n_burn`` steps and discard them.
-    3. **Sequential update** — for each kept day draw independent
-       ``V^c, V^(0), V^(1) ~ N(0, I_J)``, form ``W^k = L_k V^k``, assemble
-       ``Z^(r) = (-1)^r sqrt(lambda) W^c + sqrt(1-lambda) W^(r)`` and select the
-       component ``Z = Z^(R)`` (Eq. z_selection_direct), then apply the threshold.
+    1. **Spatial Cholesky factorisation** — build the covariance ``Sigma(sigma)``
+       on the rescaled stations and factor ``Sigma = L L^T`` once. ``jitter``
+       defaults to ``0``; set it to a small positive value (e.g. ``1e-6``) to
+       stabilise the factorisation if ``Sigma`` is near-singular.
+    2. **Initialisation + burn-in** — if ``R0`` / ``D0`` are not provided, set
+       ``R0[j] = 0`` and ``D0[j] = 1`` for every station (arbitrary deterministic
+       all-dry start), then run ``n_burn`` steps and discard them so the chain
+       reaches its stationary regime.
+    3. **Sequential update** — for each kept day, draw ``V ~ N(0, I_J)``, set
+       ``Y = L V`` (so ``Y ~ N(0, Sigma)``), and apply the threshold rule of
+       Eq. (3) of the article via the sign-adjusted field
+       ``Z[j] = (-1)^R[j] * Y[j]``.
 
     Returns the same ``history`` dict layout as :func:`simulate_history` (keys
-    ``station_names``, ``R``, ``D``, ``S``, ``q``, ``z``, ``theta``) so the
-    simulated trajectory can be fed back into :func:`mle_theta_pairwise`.
+    ``station_names``, ``R``, ``D``, ``S``, ``q``, ``z``) so the simulated
+    trajectory can be fed back into :func:`mle_sigma_pairwise` for diagnostics.
+    For an ensemble of ``M`` independent trajectories, call this function ``M``
+    times with different ``seed`` values.
     """
-    th = normalize_theta(theta)
-    lam = th["lam"]
     if station_names is None:
         station_names = sorted(list(params_by_station.keys()))
     m = len(station_names)
 
-    # Step 1: factor the three latent covariance matrices once.
-    field_cov = build_field_cov_matrices(station_names, params_by_station, th)
-
-    def _chol(C):
-        return np.linalg.cholesky(C + jitter * np.eye(m)) if jitter > 0 else np.linalg.cholesky(C)
-
-    Lc, L0, L1 = _chol(field_cov["wc"]), _chol(field_cov["w0"]), _chol(field_cov["w1"])
+    # Step 1: spatial Cholesky factorisation (done once).
+    C = build_C_from_sigma(station_names, params_by_station, sigma)
+    L = np.linalg.cholesky(C + jitter * np.eye(m)) if jitter > 0 else np.linalg.cholesky(C)
 
     rng = np.random.default_rng(seed)
 
@@ -453,11 +310,17 @@ def simulate_cholesky(
         D = np.asarray(D0, dtype=int).copy()
 
     def step(R, D):
-        Wc = Lc @ rng.standard_normal(m)
-        W0 = L0 @ rng.standard_normal(m)
-        W1 = L1 @ rng.standard_normal(m)
-        Z = _assemble_selected_field(R, lam, Wc, W0, W1)
-        q, z = _exit_probs(R, D, params_by_station, station_names, clip_q)
+        V = rng.standard_normal(m)
+        Y = L @ V
+        Z = np.where(R == 0, Y, -Y)
+        q = np.empty(m, dtype=float)
+        for j, name in enumerate(station_names):
+            f = params_by_station[name][
+                "q_d_dry_function" if R[j] == 0 else "q_d_wet_function"
+            ]
+            q[j] = float(f(D[j]))
+        q = np.clip(q, clip_q, 1.0 - clip_q)
+        z = norm.ppf(q)
         switch = Z <= z
         R_next = R.copy()
         D_next = D.copy()
@@ -489,7 +352,7 @@ def simulate_cholesky(
         "S": S_hist,
         "q": q_hist,
         "z": z_hist,
-        "theta": th,
+        "sigma": float(sigma),
     }
 
 
@@ -497,23 +360,15 @@ def simulate_history(
     n_steps: int,
     R0: np.ndarray,
     D0: np.ndarray,
-    theta,
+    C: np.ndarray,
     params_by_station: Dict[str, dict],
     station_names: Optional[Sequence[str]] = None,
     seed: Optional[int] = None,
 ) -> dict:
-    """Simulate ``n_steps`` of the spatial LMC-BMCD; returns a ``history`` dict.
-
-    Per-step ("svd") simulator: each day the three latent fields are drawn with
-    ``rng.multivariate_normal`` (no burn-in). ``theta`` is the LMC parameter
-    ``(lambda, sigma_wc, sigma_w0, sigma_w1)``.
-    """
-    th = normalize_theta(theta)
-    lam = th["lam"]
+    """Simulate ``n_steps`` of the spatial BMCD; returns a ``history`` dict."""
     if station_names is None:
         station_names = sorted(list(params_by_station.keys()))
     m = len(station_names)
-    field_cov = build_field_cov_matrices(station_names, params_by_station, th)
 
     rng = np.random.default_rng(seed)
     R_hist = np.empty((n_steps + 1, m), dtype=float)
@@ -528,7 +383,7 @@ def simulate_history(
 
     for n in range(n_steps):
         R, D, S, q, z = step_spatial_markov(
-            R, D, field_cov, lam, params_by_station, rng=rng, station_names=station_names
+            R, D, C, params_by_station, rng=rng, station_names=station_names
         )
         R_hist[n + 1], D_hist[n + 1] = R, D
         S_hist[n], q_hist[n], z_hist[n] = S, q, z
@@ -540,7 +395,6 @@ def simulate_history(
         "S": S_hist,
         "q": q_hist,
         "z": z_hist,
-        "theta": th,
     }
 
 
@@ -645,25 +499,11 @@ def phi2_vec(z1, z2, rho, indep_tol: float = 1e-14):
     return out
 
 
-def _select_pair_rho(blocks_v, Rv, j, k):
-    """LMC off-diagonal ``rho = C^(r_j, r_k)`` for a single pair — Eq. (rho_direct)."""
-    if Rv[j] == 0 and Rv[k] == 0:
-        return blocks_v["C00"][j, k]
-    if Rv[j] == 1 and Rv[k] == 1:
-        return blocks_v["C11"][j, k]
-    return blocks_v["C01"][j, k]
-
-
 def pairwise_loglik_one_step_nanaware(
-    Rn, Dn, Sn, blocks, params_by_station,
+    Rn, Dn, Sn, C, params_by_station,
     station_names=None, eps: float = 1e-15, clip_q: float = 1e-12,
 ):
-    """One-step pairwise composite log-likelihood, robust to NaN stations.
-
-    ``blocks`` are the LMC covariance blocks from :func:`build_lmc_blocks`
-    (full station set); each pair's correlation is the state-selected block
-    ``rho = C^(r_j, r_k)(s_j, s_k)`` (Eq. rho_direct), no sign flip.
-    """
+    """One-step pairwise composite log-likelihood, robust to NaN stations."""
     if station_names is None:
         station_names = sorted(list(params_by_station.keys()))
     Rn, Dn, Sn = np.asarray(Rn), np.asarray(Dn), np.asarray(Sn)
@@ -676,7 +516,7 @@ def pairwise_loglik_one_step_nanaware(
         return 0.0, idx.size
 
     station_names_v = [station_names[i] for i in idx]
-    blocks_v = {k: blocks[k][np.ix_(idx, idx)] for k in ("C00", "C11", "C01")}
+    C_v = C[np.ix_(idx, idx)]
     Rv = Rn[idx].astype(int)
     Dv = Dn[idx].astype(int)
     Sv = Sn[idx].astype(bool)
@@ -694,7 +534,7 @@ def pairwise_loglik_one_step_nanaware(
     ll = 0.0
     for j in range(m - 1):
         for k in range(j + 1, m):
-            rho_star = _select_pair_rho(blocks_v, Rv, j, k)
+            rho_star = ((-1) ** (Rv[j] + Rv[k])) * C_v[j, k]
             q_joint = phi2(z[j], z[k], rho_star)
             if Sv[j] and Sv[k]:
                 p = q_joint
@@ -711,7 +551,7 @@ def pairwise_loglik_one_step_nanaware(
 
 
 def pairwise_loglik_one_step_nanaware_vec(
-    Rn, Dn, Sn, blocks, params_by_station,
+    Rn, Dn, Sn, C, params_by_station,
     station_names=None, eps: float = 1e-15, clip_q: float = 1e-12,
 ):
     """Vectorised one-step pairwise composite log-likelihood, robust to NaN stations.
@@ -719,9 +559,8 @@ def pairwise_loglik_one_step_nanaware_vec(
     Same NaN-valid masking and ``(ll, m)`` return contract as the scalar
     :func:`pairwise_loglik_one_step_nanaware`, but the double ``for j,k`` pair
     loop is replaced by an ``np.triu_indices`` rewrite that calls the closed-form
-    :func:`phi2_vec` once over all pairs. Each pair's correlation is the
-    state-selected LMC block ``rho = C^(r_j, r_k)`` (Eq. rho_direct). Returns the
-    same number to ~1e-3 (the approximation error of ``phi2_vec``).
+    :func:`phi2_vec` once over all pairs. Returns the same number to ~1e-3 (the
+    approximation error of ``phi2_vec``).
     """
     if station_names is None:
         station_names = sorted(list(params_by_station.keys()))
@@ -735,7 +574,7 @@ def pairwise_loglik_one_step_nanaware_vec(
         return 0.0, idx.size
 
     station_names_v = [station_names[i] for i in idx]
-    blocks_v = {k: blocks[k][np.ix_(idx, idx)] for k in ("C00", "C11", "C01")}
+    C_v = C[np.ix_(idx, idx)]
     Rv = Rn[idx].astype(int)
     Dv = Dn[idx].astype(int)
     Sv = Sn[idx].astype(bool)
@@ -751,11 +590,8 @@ def pairwise_loglik_one_step_nanaware_vec(
     z = norm.ppf(q)
 
     j, k = np.triu_indices(m, 1)
-    rj, rk = Rv[j], Rv[k]
-    rho_star = np.where(
-        (rj == 0) & (rk == 0), blocks_v["C00"][j, k],
-        np.where((rj == 1) & (rk == 1), blocks_v["C11"][j, k], blocks_v["C01"][j, k]),
-    )
+    sign = 1 - 2 * ((Rv[j] + Rv[k]) % 2)  # (-1)^(Rj+Rk)
+    rho_star = sign * C_v[j, k]
     q_joint = np.asarray(phi2_vec(z[j], z[k], rho_star))
     qj, qk = q[j], q[k]
     sj, sk = Sv[j], Sv[k]
@@ -771,11 +607,10 @@ def pairwise_loglik_one_step_nanaware_vec(
 
 
 def pairwise_loglik_from_history(
-    history, blocks, params_by_station, eps=1e-15, clip_q=1e-12, vectorized=False,
+    history, C, params_by_station, eps=1e-15, clip_q=1e-12, vectorized=False,
 ):
     """Pairwise composite log-likelihood summed over all time steps of one history.
 
-    ``blocks`` are the LMC covariance blocks from :func:`build_lmc_blocks`.
     ``vectorized=True`` uses the fast closed-form :func:`phi2_vec` kernel via
     :func:`pairwise_loglik_one_step_nanaware_vec`; the default uses the exact
     scipy :func:`phi2`.
@@ -793,7 +628,7 @@ def pairwise_loglik_from_history(
         if not np.any(np.isfinite(R_hist[n])):
             continue
         ll, m = one_step(
-            R_hist[n], D_hist[n], S_hist[n], blocks, params_by_station,
+            R_hist[n], D_hist[n], S_hist[n], C, params_by_station,
             station_names=station_names, eps=eps, clip_q=clip_q,
         )
         total += ll
@@ -801,79 +636,69 @@ def pairwise_loglik_from_history(
     return total, nb_obs
 
 
-def pairwise_loglik_given_theta(history, params_by_station, theta, eps=1e-15, vectorized=False):
+def pairwise_loglik_given_sigma(history, params_by_station, sigma, eps=1e-15, vectorized=False):
     station_names = history["station_names"]
-    blocks = build_lmc_blocks(station_names, params_by_station, theta)
+    C_sigma = build_C_from_sigma(station_names, params_by_station, sigma)
     return pairwise_loglik_from_history(
-        history, blocks, params_by_station, eps=eps, vectorized=vectorized
+        history, C_sigma, params_by_station, eps=eps, vectorized=vectorized
     )[0]
 
 
-# Default optimiser box: lambda in [0, 1], each range in [1e-3, 5].
-THETA_BOUNDS = ((0.0, 1.0), (1e-3, 5.0), (1e-3, 5.0), (1e-3, 5.0))
-THETA_X0 = (0.5, 0.3, 0.3, 0.3)
+def mle_sigma_pairwise(history, params_by_station, bounds=(1e-3, 5.0), eps=1e-15, vectorized=False):
+    """Bounded 1-D maximiser of the pairwise composite likelihood in ``sigma``.
 
-
-def mle_theta_pairwise(
-    history, params_by_station, bounds=THETA_BOUNDS, x0=THETA_X0,
-    eps=1e-15, vectorized=False,
-):
-    """Maximiser of the pairwise composite likelihood in ``theta``.
-
-    Optimises ``theta = (lambda, sigma_wc, sigma_w0, sigma_w1)`` with L-BFGS-B over
-    the box ``bounds``. ``vectorized=True`` evaluates the likelihood with the fast
-    :func:`phi2_vec` kernel; the default uses the exact scipy :func:`phi2`.
+    ``vectorized=True`` evaluates the likelihood with the fast :func:`phi2_vec`
+    kernel; the default uses the exact scipy :func:`phi2`.
     """
-    def neg_ll(x):
-        return -pairwise_loglik_given_theta(
-            history, params_by_station, x, eps=eps, vectorized=vectorized
+    def neg_ll(sigma):
+        return -pairwise_loglik_given_sigma(
+            history, params_by_station, sigma, eps=eps, vectorized=vectorized
         )
 
-    res = minimize(neg_ll, x0=np.asarray(x0, float), method="L-BFGS-B", bounds=bounds)
-    theta_hat = normalize_theta(res.x)
+    res = minimize_scalar(neg_ll, bounds=bounds, method="bounded")
+    sigma_hat = float(res.x)
     ll_hat = float(-res.fun)
     station_names = history["station_names"]
-    blocks_hat = build_lmc_blocks(station_names, params_by_station, theta_hat)
+    C_hat = build_C_from_sigma(station_names, params_by_station, sigma_hat)
     nb_obs = pairwise_loglik_from_history(
-        history, blocks_hat, params_by_station, eps=eps, vectorized=vectorized
+        history, C_hat, params_by_station, eps=eps, vectorized=vectorized
     )[1]
     return {
-        "theta_hat": theta_hat,
+        "sigma_hat": sigma_hat,
         "ll_hat": ll_hat,
         "opt_result": res,
         "total_nb_observed_stations": nb_obs,
     }
 
 
-def pairwise_loglik_from_histories(histories, blocks, params_by_station, eps=1e-15, vectorized=False):
+def pairwise_loglik_from_histories(histories, C, params_by_station, eps=1e-15, vectorized=False):
     total, nb_obs = 0.0, 0.0
     for h in histories:
         ll, m = pairwise_loglik_from_history(
-            h, blocks, params_by_station, eps=eps, vectorized=vectorized
+            h, C, params_by_station, eps=eps, vectorized=vectorized
         )
         total += ll
         nb_obs += m
     return total, nb_obs
 
 
-def mle_theta_pairwise_histories(
-    histories, params_by_station, bounds=THETA_BOUNDS, x0=THETA_X0,
-    eps=1e-15, vectorized=False,
+def mle_sigma_pairwise_histories(
+    histories, params_by_station, bounds=(1e-3, 5.0), eps=1e-15, vectorized=False
 ):
-    """Pairwise-MLE of ``theta`` summing the likelihood across several histories.
+    """Pairwise-MLE of ``sigma`` summing the likelihood across several histories.
 
     ``vectorized=True`` uses the fast :func:`phi2_vec` kernel.
     """
     station_names = histories[0]["station_names"]
 
-    def neg_ll(x):
-        blocks = build_lmc_blocks(station_names, params_by_station, x)
+    def neg_ll(sigma):
+        C_sigma = build_C_from_sigma(station_names, params_by_station, sigma)
         return -pairwise_loglik_from_histories(
-            histories, blocks, params_by_station, eps=eps, vectorized=vectorized
+            histories, C_sigma, params_by_station, eps=eps, vectorized=vectorized
         )[0]
 
-    res = minimize(neg_ll, x0=np.asarray(x0, float), method="L-BFGS-B", bounds=bounds)
-    return {"theta_hat": normalize_theta(res.x), "ll_hat": float(-res.fun), "opt_result": res}
+    res = minimize_scalar(neg_ll, bounds=bounds, method="bounded")
+    return {"sigma_hat": float(res.x), "ll_hat": float(-res.fun), "opt_result": res}
 
 
 # ---------------------------------------------------------------------------
@@ -913,35 +738,33 @@ def inject_nans_in_history(history, frac_nan: float = 0.10, seed: int = 0, mask_
 
 def run_simulation_mle_experiment(
     dict_model_params: Dict[str, dict],
-    theta_true,
+    sigma_true: float,
     nb_stations: int,
     nb_steps: int,
     nb_estimations: int,
     inject_nan_frac: float = 0.0,
     nan_seed: int = 123,
     seed_base: int = 0,
-    bounds=THETA_BOUNDS,
-    x0=THETA_X0,
+    bounds=(1e-3, 2.0),
     vectorized: bool = False,
     simulator: str = "cholesky",
     n_burn: int = 200,
 ) -> pd.DataFrame:
-    """Simulate ``nb_estimations`` spatial histories and fit ``theta`` on each.
+    """Simulate ``nb_estimations`` spatial histories and fit ``sigma`` on each.
 
-    ``theta_true = (lambda, sigma_wc, sigma_w0, sigma_w1)`` is the LMC parameter.
-    Each returned row carries the recovered ``lam_hat, sigma_wc_hat, sigma_w0_hat,
-    sigma_w1_hat`` and ``ll_hat``.
+    Mirrors the repeated ``Max likelihood estimation`` / ``Check that the
+    estimation works with NaN values`` cells in the original notebook.
 
-    ``simulator`` selects how the latent Gaussian fields are drawn:
+    ``simulator`` selects how the latent Gaussian field is drawn:
 
-    - ``"cholesky"`` (default) — :func:`simulate_cholesky` (factor each
-      ``Sigma_k = L_k L_k^T`` once), with a burn-in of ``n_burn`` days. Used by
-      the clean pipeline notebook and the parameter-estimation tests.
-    - ``"svd"`` — :func:`simulate_history` / :func:`step_spatial_markov`, i.e.
-      numpy's ``multivariate_normal`` (SVD factorisation) per step, no burn-in.
+    - ``"cholesky"`` (default) — generate each history with
+      :func:`simulate_cholesky` (factor ``Sigma = L L^T`` once, ``Y = L V``),
+      including a burn-in of ``n_burn`` days. This is the simulator used by the
+      clean pipeline notebook and the parameter-estimation tests.
+    - ``"svd"`` — generate with :func:`simulate_history` / :func:`step_spatial_markov`,
+      i.e. numpy's ``multivariate_normal`` (SVD factorisation) with no burn-in.
       Kept for the explicit Cholesky-vs-SVD comparison in ``tests_simulation_methods``.
     """
-    th_true = normalize_theta(theta_true)
     extract_stations = sorted(list(dict_model_params.keys()))[:nb_stations]
     params_by_station = {c: dict_model_params[c] for c in extract_stations}
     station_names = extract_stations  # already sorted
@@ -952,18 +775,19 @@ def run_simulation_mle_experiment(
     if simulator == "svd":
         R0 = np.ones(len(extract_stations), dtype=int)
         D0 = np.ones(len(extract_stations), dtype=int)
+        C = build_C_from_sigma(station_names, params_by_station, sigma=sigma_true)
 
     rows = []
     for i in range(nb_estimations):
         if simulator == "cholesky":
             history = simulate_cholesky(
-                theta=th_true, params_by_station=params_by_station,
+                sigma=sigma_true, params_by_station=params_by_station,
                 n_steps=nb_steps, n_burn=n_burn,
                 station_names=station_names, seed=seed_base + i,
             )
         else:
             history = simulate_history(
-                n_steps=nb_steps, R0=R0, D0=D0, theta=th_true,
+                n_steps=nb_steps, R0=R0, D0=D0, C=C,
                 params_by_station=params_by_station,
                 station_names=station_names, seed=seed_base + i,
             )
@@ -971,21 +795,15 @@ def run_simulation_mle_experiment(
             history = inject_nans_in_history(
                 history, frac_nan=inject_nan_frac, seed=nan_seed, mask_S=True
             )
-        mle = mle_theta_pairwise(
-            history, params_by_station, bounds=bounds, x0=x0, vectorized=vectorized
-        )
-        th_hat = mle["theta_hat"]
+        mle = mle_sigma_pairwise(history, params_by_station, bounds=bounds, vectorized=vectorized)
         rows.append({
             "i": i,
-            "lam_hat": th_hat["lam"],
-            "sigma_wc_hat": th_hat["sigma_wc"],
-            "sigma_w0_hat": th_hat["sigma_w0"],
-            "sigma_w1_hat": th_hat["sigma_w1"],
+            "sigma_hat": mle["sigma_hat"],
             "ll_hat": mle["ll_hat"],
             "mean_nb_obs_stations": mle["total_nb_observed_stations"] / nb_steps,
         })
     df = pd.DataFrame(rows)
-    df.attrs["theta_true"] = th_true
+    df.attrs["sigma_true"] = sigma_true
     df.attrs["nb_stations"] = nb_stations
     df.attrs["nb_steps"] = nb_steps
     df.attrs["inject_nan_frac"] = inject_nan_frac
@@ -1206,7 +1024,7 @@ def history_from_Rbin_drop_ambiguous_spell_after_nan(Rbin: pd.DataFrame) -> dict
 def split_history_by_year(history: dict) -> List[dict]:
     """Split a single history dict into one history per calendar year.
 
-    Useful to feed :func:`mle_theta_pairwise_histories`: each season-year
+    Useful to feed :func:`mle_sigma_pairwise_histories`: each season-year
     becomes an (approximately) independent segment.
     """
     dates = pd.DatetimeIndex(history["dates"])
