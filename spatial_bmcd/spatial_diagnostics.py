@@ -21,7 +21,7 @@ Methodology shared by every diagnostic
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -535,6 +535,180 @@ def plot_occurrence_raster_obs_vs_sim(
                bbox_to_anchor=(0.5, 1.0))
     fig.suptitle("Occurrence raster, stations ordered by spatial proximity",
                  y=1.04, fontsize=12)
+
+    if save:
+        fig.savefig(_ensure_figures_dir() / filename, bbox_inches="tight")
+    return fig
+
+
+_SEASON_COLORS = {
+    "winter": "#7570b3",
+    "spring": "#66a61e",
+    "summer": "#e6ab02",
+    "autumn": "#a6761d",
+}
+
+
+def history_to_Rbin(history: dict) -> pd.DataFrame:
+    """Seasonal simulated history -> days x stations 0/1 occurrence DataFrame.
+
+    ``history`` comes from :func:`spatial_model.simulate_cholesky_seasonal`,
+    whose ``R`` rows are aligned one-to-one with ``history["dates"]``.
+    """
+    return pd.DataFrame(
+        history["R"],
+        index=pd.DatetimeIndex(history["dates"]),
+        columns=history["station_names"],
+    )
+
+
+def _draw_time_rows_panel(ax_season, ax, Rbin, order, heavy_dry_min_days):
+    """One season-strip + raster panel of the time-rows occurrence raster."""
+    from spatial_bmcd.spatial_model import season_of_dates
+
+    station_names = list(Rbin.columns)
+    order_idx = [station_names.index(c) for c in order]
+    dates = pd.DatetimeIndex(pd.to_datetime(Rbin.index))
+    cat = _category_matrix(Rbin.to_numpy(dtype=float), heavy_dry_min_days)[:, order_idx]
+
+    # Main raster: time on rows, seriated stations on columns.
+    cmap = ListedColormap(_RASTER_COLORS)
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
+    ax.imshow(cat, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(order, rotation=90, fontsize=5)
+    ax.tick_params(top=False, bottom=False, labeltop=True, labelbottom=True,
+                   left=False, labelleft=False)
+
+    # Season sidebar strip (one colour per meteorological season).
+    seasons = season_of_dates(dates)
+    season_keys = list(_SEASON_COLORS)
+    season_int = np.array([season_keys.index(s) for s in seasons])[:, None]
+    ax_season.imshow(
+        season_int, aspect="auto", interpolation="nearest",
+        cmap=ListedColormap(list(_SEASON_COLORS.values())),
+        norm=BoundaryNorm(np.arange(len(season_keys) + 1) - 0.5, len(season_keys)),
+    )
+    ax_season.set_xticks([])
+
+    # Year separators + year labels at each 1 January.
+    year_starts = np.flatnonzero(np.r_[True, dates.year[1:] != dates.year[:-1]])
+    for y0 in year_starts[1:]:
+        ax.axhline(y0 - 0.5, color="white", lw=0.8)
+        ax_season.axhline(y0 - 0.5, color="white", lw=0.8)
+    ax_season.set_yticks(year_starts)
+    ax_season.set_yticklabels(dates.year[year_starts], fontsize=7)
+
+
+def _raster_legend_handles(heavy_dry_min_days):
+    """Legend patches for the raster categories + the four season colours."""
+    handles = [Patch(facecolor=c, label=l) for c, l in zip(_RASTER_COLORS, _RASTER_LABELS)]
+    handles[2] = Patch(facecolor=_RASTER_COLORS[2],
+                       label=f"heavy dry (≥ {heavy_dry_min_days} d)")
+    handles += [Patch(facecolor=c, label=s) for s, c in _SEASON_COLORS.items()]
+    return handles
+
+
+def plot_occurrence_raster_time_rows(
+    Rbin: pd.DataFrame,
+    params_by_station: Dict[str, dict],
+    order: Optional[List[str]] = None,
+    heavy_dry_min_days: int = 10,
+    time_window: Optional[Tuple[str, str]] = None,
+    station_width: Optional[float] = None,
+    title: str = "Occurrence raster",
+    save: bool = True,
+    filename: str = "diag_raster_time_rows.pdf",
+    figsize=(12, 40),
+):
+    """Calendar occurrence raster: one row per day, stations on the columns.
+
+    Transposed variant of :func:`plot_occurrence_raster_obs_vs_sim` for a
+    *continuous multi-season* record (observed ``Rbin`` or simulated one via
+    :func:`history_to_Rbin`): time runs top to bottom over the full calendar,
+    stations are ordered by spatial proximity (:func:`spatial_station_order`),
+    and a narrow left strip colours each day by its meteorological season.
+    Cells encode wet / dry / heavy dry (running dry age >= ``heavy_dry_min_days``,
+    censored only at NaNs and at the record start) / missing. Year separators
+    (thin white lines) and year labels mark each 1 January.
+
+    ``time_window=(start, end)`` restricts the plot to that date range
+    (inclusive, anything ``pd.Timestamp`` accepts, e.g. ``("1990", "1995")``);
+    heavy-dry ages are censored at the window start like at a record start.
+    ``station_width`` (inches per station column) overrides the width in
+    ``figsize`` so column size is set directly.
+    """
+    if time_window is not None:
+        Rbin = Rbin.loc[time_window[0]:time_window[1]]
+    if order is None:
+        order = spatial_station_order(params_by_station, list(Rbin.columns))
+    if station_width is not None:
+        figsize = (len(order) * station_width + 1.0, figsize[1])
+
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(1, 2, width_ratios=[1, 50], wspace=0.02,
+                  left=0.07, right=0.99, top=0.96, bottom=0.03)
+    ax_season = fig.add_subplot(gs[0, 0])
+    ax = fig.add_subplot(gs[0, 1], sharey=ax_season)
+    _draw_time_rows_panel(ax_season, ax, Rbin, order, heavy_dry_min_days)
+
+    fig.legend(handles=_raster_legend_handles(heavy_dry_min_days),
+               loc="upper center", ncol=8, frameon=False,
+               bbox_to_anchor=(0.5, 0.99), fontsize=8)
+    fig.suptitle(title, y=0.995, fontsize=12)
+
+    if save:
+        fig.savefig(_ensure_figures_dir() / filename, bbox_inches="tight")
+    return fig
+
+
+def plot_occurrence_raster_time_rows_pair(
+    Rbin_left: pd.DataFrame,
+    Rbin_right: pd.DataFrame,
+    params_by_station: Dict[str, dict],
+    order: Optional[List[str]] = None,
+    heavy_dry_min_days: int = 10,
+    time_window: Optional[Tuple[str, str]] = None,
+    station_width: Optional[float] = None,
+    titles: Sequence[str] = ("Observed", "Simulated"),
+    suptitle: Optional[str] = None,
+    save: bool = True,
+    filename: str = "diag_raster_time_rows_pair.pdf",
+    figsize=(24, 44),
+):
+    """Two calendar occurrence rasters side by side (e.g. observed vs simulated).
+
+    Each half is one :func:`plot_occurrence_raster_time_rows` panel (season
+    strip + raster) with its own ``titles`` entry; the legend (and optional
+    ``suptitle``) is shared. Both records use the same station ``order`` so the
+    columns are directly comparable. ``time_window`` and ``station_width``
+    behave as in :func:`plot_occurrence_raster_time_rows` (the window is
+    applied to both records; the width accounts for the two panels).
+    """
+    if time_window is not None:
+        Rbin_left = Rbin_left.loc[time_window[0]:time_window[1]]
+        Rbin_right = Rbin_right.loc[time_window[0]:time_window[1]]
+    if order is None:
+        order = spatial_station_order(params_by_station, list(Rbin_left.columns))
+    if station_width is not None:
+        figsize = (2 * len(order) * station_width + 2.0, figsize[1])
+
+    fig = plt.figure(figsize=figsize)
+    outer = GridSpec(1, 2, wspace=0.10,
+                     left=0.045, right=0.99, top=0.95, bottom=0.03)
+    for Rbin, spec, panel_title in zip((Rbin_left, Rbin_right), outer, titles):
+        inner = spec.subgridspec(1, 2, width_ratios=[1, 50], wspace=0.02)
+        ax_season = fig.add_subplot(inner[0, 0])
+        ax = fig.add_subplot(inner[0, 1], sharey=ax_season)
+        _draw_time_rows_panel(ax_season, ax, Rbin, order, heavy_dry_min_days)
+        # y unset -> matplotlib auto-places the title above the top tick labels.
+        ax.set_title(panel_title, fontsize=11)
+
+    fig.legend(handles=_raster_legend_handles(heavy_dry_min_days),
+               loc="upper center", ncol=8, frameon=False,
+               bbox_to_anchor=(0.5, 0.998), fontsize=8)
+    if suptitle:
+        fig.suptitle(suptitle, y=0.9995, fontsize=13)
 
     if save:
         fig.savefig(_ensure_figures_dir() / filename, bbox_inches="tight")

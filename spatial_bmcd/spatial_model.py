@@ -493,6 +493,141 @@ def simulate_cholesky(
     }
 
 
+def simulate_cholesky_seasonal(
+    dates,
+    theta_by_season: Dict[str, object],
+    params_by_season: Dict[str, Dict[str, dict]],
+    station_names: Optional[Sequence[str]] = None,
+    n_burn: int = 1000,
+    seed: Optional[int] = None,
+    clip_q: float = 1e-12,
+    jitter: float = 0.0,
+) -> dict:
+    """Simulate one continuous LMC-BMCD trajectory across successive seasons.
+
+    Same Cholesky scheme as :func:`simulate_cholesky` (Section 5 of main.tex),
+    but with one fitted parameter set per meteorological season and the
+    following season-transition rule:
+
+    - **spatial field**: the latent fields ``W^c, W^(0), W^(1)`` driving the
+      transition from day ``n`` to ``n+1`` use ``theta_by_season[s(n)]`` where
+      ``s(n)`` is the season of day ``n`` — the field parameters switch on the
+      first day of each new season;
+    - **exit probabilities**: the ongoing spell at station ``j`` keeps the
+      ``q``-closures of the season in which the spell *started* until its next
+      state switch (a dry spell starting on the last day of spring keeps the
+      spring exit probabilities until it ends, even in summer); the spell that
+      starts on day ``n+1`` after a switch is stamped with season ``s(n+1)``.
+
+    Otherwise each transition is exactly Eq. (spatialized_markov_model_option2)
+    of main.tex.
+
+    ``dates`` is the daily calendar to simulate (consecutive days). The burn-in
+    extends the calendar *backwards* by ``n_burn`` days, so the burn-in follows
+    the real season sequence preceding ``dates[0]`` and is then discarded.
+
+    Per-season covariances are built from that season's own ``params_by_season``
+    entries (normalised coordinates), consistent with how each seasonal ``theta``
+    was fitted. Returns the :func:`simulate_cholesky` history layout (``R``/``D``
+    have one row per day of ``dates``, ``S``/``q``/``z`` one row per transition)
+    plus ``dates`` and ``theta_by_season``.
+    """
+    dates = pd.DatetimeIndex(pd.to_datetime(dates))
+    if not (np.diff(dates.to_numpy()) == np.timedelta64(1, "D")).all():
+        raise ValueError("`dates` must be consecutive daily dates")
+    if station_names is None:
+        station_names = sorted(
+            set.intersection(*(set(p) for p in params_by_season.values()))
+        )
+    station_names = list(station_names)
+    m = len(station_names)
+    seasons = sorted(theta_by_season)
+    if sorted(params_by_season) != seasons:
+        raise ValueError("theta_by_season and params_by_season must cover the same seasons")
+
+    # One (lambda, Cholesky factors) set per season, from that season's theta
+    # and normalised coordinates.
+    def _chol(C):
+        return np.linalg.cholesky(C + jitter * np.eye(m)) if jitter > 0 else np.linalg.cholesky(C)
+
+    lam_by_season, factors_by_season = {}, {}
+    for s in seasons:
+        th = normalize_theta(theta_by_season[s])
+        cov = build_field_cov_matrices(station_names, params_by_season[s], th)
+        lam_by_season[s] = th["lam"]
+        factors_by_season[s] = tuple(_chol(cov[k]) for k in ("wc", "w0", "w1"))
+
+    # Burn-in calendar: n_burn real days preceding dates[0].
+    burn_dates = pd.date_range(end=dates[0] - pd.Timedelta(days=1), periods=n_burn, freq="D")
+    full_dates = burn_dates.append(dates)
+    season_seq = season_of_dates(full_dates)
+    missing = set(season_seq) - set(seasons)
+    if missing:
+        raise ValueError(f"no fitted parameters for season(s) {sorted(missing)}")
+
+    rng = np.random.default_rng(seed)
+
+    # All-dry start; the initial spells are stamped with the first day's season.
+    R = np.zeros(m, dtype=int)
+    D = np.ones(m, dtype=int)
+    spell_season = np.full(m, season_seq[0], dtype=object)
+
+    def _q_thresholds(R, D, spell_season):
+        q = np.empty(m, dtype=float)
+        for j, name in enumerate(station_names):
+            f = params_by_season[spell_season[j]][name][
+                "q_d_dry_function" if R[j] == 0 else "q_d_wet_function"
+            ]
+            q[j] = float(f(D[j]))
+        q = np.clip(q, clip_q, 1.0 - clip_q)
+        return q, norm.ppf(q)
+
+    def step(R, D, spell_season, n):
+        Lc, L0, L1 = factors_by_season[season_seq[n]]
+        Wc = Lc @ rng.standard_normal(m)
+        W0 = L0 @ rng.standard_normal(m)
+        W1 = L1 @ rng.standard_normal(m)
+        Z = _assemble_selected_field(R, lam_by_season[season_seq[n]], Wc, W0, W1)
+        q, z = _q_thresholds(R, D, spell_season)
+        switch = Z <= z
+        R_next = R.copy()
+        D_next = D.copy()
+        R_next[switch] = 1 - R_next[switch]
+        D_next[switch] = 1
+        D_next[~switch] = D_next[~switch] + 1
+        spell_season_next = spell_season.copy()
+        spell_season_next[switch] = season_seq[n + 1]
+        return R_next, D_next, spell_season_next, switch.astype(float), q, z
+
+    # Burn-in transitions over the prepended real calendar.
+    for n in range(n_burn):
+        R, D, spell_season, _, _, _ = step(R, D, spell_season, n)
+
+    # Kept trajectory: one state row per day of `dates`, one S/q/z row per transition.
+    n_steps = len(dates) - 1
+    R_hist = np.empty((n_steps + 1, m), dtype=float)
+    D_hist = np.empty((n_steps + 1, m), dtype=float)
+    S_hist = np.empty((n_steps, m), dtype=float)
+    q_hist = np.empty((n_steps, m), dtype=float)
+    z_hist = np.empty((n_steps, m), dtype=float)
+    R_hist[0], D_hist[0] = R, D
+    for k in range(n_steps):
+        R, D, spell_season, S, q, z = step(R, D, spell_season, n_burn + k)
+        R_hist[k + 1], D_hist[k + 1] = R, D
+        S_hist[k], q_hist[k], z_hist[k] = S, q, z
+
+    return {
+        "station_names": station_names,
+        "dates": dates,
+        "R": R_hist,
+        "D": D_hist,
+        "S": S_hist,
+        "q": q_hist,
+        "z": z_hist,
+        "theta_by_season": {s: normalize_theta(theta_by_season[s]) for s in seasons},
+    }
+
+
 def simulate_history(
     n_steps: int,
     R0: np.ndarray,
@@ -1064,21 +1199,32 @@ def load_all_station_rr(
     return dfs_by_city
 
 
-def _season_mask(dates: pd.DatetimeIndex, season: str) -> np.ndarray:
+_MONTH_TO_SEASON = np.array(
+    ["winter", "winter",                       # Jan, Feb
+     "spring", "spring", "spring",             # Mar, Apr, May
+     "summer", "summer", "summer",             # Jun, Jul, Aug
+     "autumn", "autumn", "autumn",             # Sep, Oct, Nov
+     "winter"],                                # Dec
+    dtype=object,
+)
+
+
+def season_of_dates(dates) -> np.ndarray:
+    """Meteorological season label of each date (DJF/MAM/JJA/SON)."""
     dates = pd.to_datetime(dates)
     if not isinstance(dates, pd.DatetimeIndex):
         dates = pd.DatetimeIndex(dates)
-    m = dates.month
+    return _MONTH_TO_SEASON[dates.month.to_numpy() - 1]
+
+
+def _season_mask(dates: pd.DatetimeIndex, season: str) -> np.ndarray:
     season = season.strip().lower()
-    if season == "winter":
-        return m.isin([12, 1, 2])
-    if season == "spring":
-        return m.isin([3, 4, 5])
-    if season == "summer":
-        return m.isin([6, 7, 8])
-    if season == "autumn":
-        return m.isin([9, 10, 11])
-    raise ValueError(f"Unknown season: {season!r}")
+    labels = season_of_dates(dates)
+    if season == "all":
+        return np.ones(labels.shape[0], dtype=bool)
+    if season not in ("winter", "spring", "summer", "autumn"):
+        raise ValueError(f"Unknown season: {season!r}")
+    return labels == season
 
 
 def build_joint_df_occurrence_from_raw_data(
@@ -1091,7 +1237,8 @@ def build_joint_df_occurrence_from_raw_data(
 ) -> pd.DataFrame:
     """Build the wet/dry occurrence matrix (days x stations) for a given season.
 
-    NaNs in the raw RR data propagate as NaNs in the occurrence matrix.
+    ``season="all"`` keeps the full calendar (no season filtering). NaNs in the
+    raw RR data propagate as NaNs in the occurrence matrix.
     """
     all_dates = []
     for name in station_names:
