@@ -24,6 +24,23 @@ with exponential latent correlations ``rho_k(h) = exp(-h / sigma_k)``. It reduce
 to the original single-latent-field model when ``lambda = 1`` (then ``sigma_wc``
 plays the role of the old scalar range ``sigma``); that frozen single-field
 implementation is kept under ``archive_old_single_latent_field/``.
+
+The module also supports the **state-dependent-lambda variant** (the blue
+"alternative suggestion", Eqs. ``lmc_fields_direct_state_dep`` /
+``lmc_blocks_inline_state_dep`` in ``main.tex``): one mixing weight per spell
+type,
+
+    Z^(r)(s) = (-1)^r * sqrt(lambda_r) * W^c(s) + sqrt(1-lambda_r) * W^(r)(s),
+
+with ``theta = (lambda_0, lambda_1, sigma_wc, sigma_w0, sigma_w1)`` and blocks
+
+    C^(0,0)(h) = lambda_0 * rho_wc(h) + (1-lambda_0) * rho_w0(h),
+    C^(1,1)(h) = lambda_1 * rho_wc(h) + (1-lambda_1) * rho_w1(h),
+    C^(0,1)(h) = -sqrt(lambda_0 * lambda_1) * rho_wc(h).
+
+Every function taking ``theta`` accepts both parametrisations (dispatch by
+length/keys, see :func:`normalize_theta`); the shared-lambda model is the
+special case ``lambda_0 = lambda_1``.
 """
 
 from __future__ import annotations
@@ -240,26 +257,56 @@ def build_C_from_sigma(
 
 
 def normalize_theta(theta) -> Dict[str, float]:
-    """Coerce ``theta`` to a dict ``{lam, sigma_wc, sigma_w0, sigma_w1}``.
+    """Coerce ``theta`` to a dict; dispatches shared vs state-dependent lambda.
 
-    Accepts a mapping with those keys (``lam`` may also be spelled ``lambda``),
-    or a length-4 sequence ``(lam, sigma_wc, sigma_w0, sigma_w1)``.
+    Accepted inputs:
+
+    - **shared-lambda model** (Eq. ``lmc_fields_direct``): a length-4 sequence
+      ``(lam, sigma_wc, sigma_w0, sigma_w1)`` or a mapping with key ``lam``
+      (also spelled ``lambda``). The returned dict has keys
+      ``lam, lam0, lam1, sigma_wc, sigma_w0, sigma_w1`` with ``lam0 = lam1 = lam``.
+    - **state-dependent-lambda model** (Eq. ``lmc_fields_direct_state_dep``):
+      a length-5 sequence ``(lam0, lam1, sigma_wc, sigma_w0, sigma_w1)`` or a
+      mapping with keys ``lam0`` / ``lam1`` (and no ``lam``). The returned dict
+      has keys ``lam0, lam1, sigma_wc, sigma_w0, sigma_w1`` — **no** ``lam`` key,
+      even if ``lam0 == lam1``.
+
+    Downstream code reads ``lam0`` / ``lam1`` (always present); the presence of
+    the ``lam`` key marks the shared parametrisation.
     """
     if isinstance(theta, dict):
-        lam = theta.get("lam", theta.get("lambda"))
-        return {
-            "lam": float(lam),
-            "sigma_wc": float(theta["sigma_wc"]),
-            "sigma_w0": float(theta["sigma_w0"]),
-            "sigma_w1": float(theta["sigma_w1"]),
-        }
-    lam, s_wc, s_w0, s_w1 = theta
-    return {
-        "lam": float(lam),
+        if "lam" in theta or "lambda" in theta:
+            lam = float(theta.get("lam", theta.get("lambda")))
+            lam0 = lam1 = lam
+            shared = True
+        else:
+            lam0, lam1 = float(theta["lam0"]), float(theta["lam1"])
+            shared = False
+        s_wc, s_w0, s_w1 = theta["sigma_wc"], theta["sigma_w0"], theta["sigma_w1"]
+    else:
+        vals = tuple(float(v) for v in theta)
+        if len(vals) == 4:
+            lam, s_wc, s_w0, s_w1 = vals
+            lam0 = lam1 = lam
+            shared = True
+        elif len(vals) == 5:
+            lam0, lam1, s_wc, s_w0, s_w1 = vals
+            shared = False
+        else:
+            raise ValueError(
+                f"theta must have 4 (shared lambda) or 5 (state-dependent lambda) "
+                f"components, got {len(vals)}"
+            )
+    out = {
+        "lam0": float(lam0),
+        "lam1": float(lam1),
         "sigma_wc": float(s_wc),
         "sigma_w0": float(s_w0),
         "sigma_w1": float(s_w1),
     }
+    if shared:
+        out = {"lam": float(lam0), **out}
+    return out
 
 
 def build_field_cov_matrices(
@@ -289,20 +336,23 @@ def build_lmc_blocks(
 
     Returns ``{"C00", "C11", "C01"}``, each a ``J x J`` matrix:
 
-        C00 = lambda * rho_wc + (1-lambda) * rho_w0,
-        C11 = lambda * rho_wc + (1-lambda) * rho_w1,
-        C01 = -lambda * rho_wc.
+        C00 = lambda_0 * rho_wc + (1-lambda_0) * rho_w0,
+        C11 = lambda_1 * rho_wc + (1-lambda_1) * rho_w1,
+        C01 = -sqrt(lambda_0 * lambda_1) * rho_wc.
 
-    Diagonals of ``C00`` and ``C11`` are 1 (unit-variance sites). ``C01`` is the
-    negative dry-wet cross-block carrying the sign.
+    Shared-lambda model: ``lambda_0 = lambda_1 = lambda`` (then ``C01`` reduces
+    to ``-lambda * rho_wc``, Eq. lmc_blocks_inline); state-dependent variant:
+    Eq. lmc_blocks_inline_state_dep. Diagonals of ``C00`` and ``C11`` are 1
+    (unit-variance sites). ``C01`` is the negative dry-wet cross-block carrying
+    the sign.
     """
     th = normalize_theta(theta)
-    lam = th["lam"]
+    lam0, lam1 = th["lam0"], th["lam1"]
     rho = build_field_cov_matrices(station_names, params_by_station, th)
     return {
-        "C00": lam * rho["wc"] + (1.0 - lam) * rho["w0"],
-        "C11": lam * rho["wc"] + (1.0 - lam) * rho["w1"],
-        "C01": -lam * rho["wc"],
+        "C00": lam0 * rho["wc"] + (1.0 - lam0) * rho["w0"],
+        "C11": lam1 * rho["wc"] + (1.0 - lam1) * rho["w1"],
+        "C01": -np.sqrt(lam0 * lam1) * rho["wc"],
     }
 
 
@@ -324,16 +374,16 @@ def build_state_selected_cov(blocks: Dict[str, np.ndarray], R: np.ndarray) -> np
     )
 
 
-def _assemble_selected_field(R, lam, Wc, W0, W1):
+def _assemble_selected_field(R, lam0, lam1, Wc, W0, W1):
     """Assemble the state-selected latent variable ``Z = Z^(R)`` — Eq. (lmc_fields_direct).
 
-    ``Z^(r) = (-1)^r sqrt(lambda) Wc + sqrt(1-lambda) W^(r)``, then select the
+    ``Z^(r) = (-1)^r sqrt(lambda_r) Wc + sqrt(1-lambda_r) W^(r)``, then select the
     component matching the current spell type ``R``. No further sign flip.
+    Shared-lambda model: ``lam0 == lam1``; state-dependent variant:
+    Eq. (lmc_fields_direct_state_dep).
     """
-    sqrt_lam = np.sqrt(lam)
-    sqrt_1ml = np.sqrt(1.0 - lam)
-    Z0 = sqrt_lam * Wc + sqrt_1ml * W0          # r = 0, (-1)^0 = +1
-    Z1 = -sqrt_lam * Wc + sqrt_1ml * W1         # r = 1, (-1)^1 = -1
+    Z0 = np.sqrt(lam0) * Wc + np.sqrt(1.0 - lam0) * W0    # r = 0, (-1)^0 = +1
+    Z1 = -np.sqrt(lam1) * Wc + np.sqrt(1.0 - lam1) * W1   # r = 1, (-1)^1 = -1
     return np.where(R == 0, Z0, Z1)
 
 
@@ -366,8 +416,13 @@ def step_spatial_markov(
     with the corresponding exponential correlation in ``field_cov``), assembles the
     state-selected variable ``Z`` and applies the switch/persist rule. The Gaussian
     vectors are drawn with ``rng.multivariate_normal`` (SVD factorisation) — the
-    per-step ("svd") simulator. Returns ``(R_next, D_next, switch, q, z)``.
+    per-step ("svd") simulator. ``lam`` is either a scalar (shared-lambda model)
+    or a pair ``(lam0, lam1)`` (state-dependent variant).
+    Returns ``(R_next, D_next, switch, q, z)``.
     """
+    lam0, lam1 = (float(lam), float(lam)) if np.isscalar(lam) else (
+        float(lam[0]), float(lam[1])
+    )
     if station_names is None:
         station_names = sorted(list(params_by_station.keys()))
     m = len(station_names)
@@ -379,7 +434,7 @@ def step_spatial_markov(
         return multivariate_normal(mean=mean, cov=C).rvs()
 
     Wc, W0, W1 = _draw(field_cov["wc"]), _draw(field_cov["w0"]), _draw(field_cov["w1"])
-    Z = _assemble_selected_field(R, lam, Wc, W0, W1)
+    Z = _assemble_selected_field(R, lam0, lam1, Wc, W0, W1)
 
     q, z = _exit_probs(R, D, params_by_station, station_names, clip_q)
     switch = Z <= z
@@ -406,8 +461,10 @@ def simulate_cholesky(
 ) -> dict:
     """Simulate a spatial LMC-BMCD trajectory by Cholesky factorisation — Section 5 of main.tex.
 
-    ``theta = (lambda, sigma_wc, sigma_w0, sigma_w1)`` (tuple or dict, see
-    :func:`normalize_theta`). Three steps, mirroring the article:
+    ``theta = (lambda, sigma_wc, sigma_w0, sigma_w1)`` for the shared-lambda
+    model, or ``(lambda_0, lambda_1, sigma_wc, sigma_w0, sigma_w1)`` for the
+    state-dependent variant (tuple or dict, see :func:`normalize_theta`).
+    Three steps, mirroring the article:
 
     1. **Spatial Cholesky factorisation** — build the three latent covariance
        matrices ``Sigma_wc, Sigma_w0, Sigma_w1`` (exponential with ranges
@@ -427,7 +484,7 @@ def simulate_cholesky(
     simulated trajectory can be fed back into :func:`mle_theta_pairwise`.
     """
     th = normalize_theta(theta)
-    lam = th["lam"]
+    lam0, lam1 = th["lam0"], th["lam1"]
     if station_names is None:
         station_names = sorted(list(params_by_station.keys()))
     m = len(station_names)
@@ -456,7 +513,7 @@ def simulate_cholesky(
         Wc = Lc @ rng.standard_normal(m)
         W0 = L0 @ rng.standard_normal(m)
         W1 = L1 @ rng.standard_normal(m)
-        Z = _assemble_selected_field(R, lam, Wc, W0, W1)
+        Z = _assemble_selected_field(R, lam0, lam1, Wc, W0, W1)
         q, z = _exit_probs(R, D, params_by_station, station_names, clip_q)
         switch = Z <= z
         R_next = R.copy()
@@ -554,7 +611,7 @@ def simulate_cholesky_seasonal(
     for s in seasons:
         th = normalize_theta(theta_by_season[s])
         cov = build_field_cov_matrices(station_names, params_by_season[s], th)
-        lam_by_season[s] = th["lam"]
+        lam_by_season[s] = (th["lam0"], th["lam1"])
         factors_by_season[s] = tuple(_chol(cov[k]) for k in ("wc", "w0", "w1"))
 
     # Burn-in calendar: n_burn real days preceding dates[0].
@@ -587,7 +644,7 @@ def simulate_cholesky_seasonal(
         Wc = Lc @ rng.standard_normal(m)
         W0 = L0 @ rng.standard_normal(m)
         W1 = L1 @ rng.standard_normal(m)
-        Z = _assemble_selected_field(R, lam_by_season[season_seq[n]], Wc, W0, W1)
+        Z = _assemble_selected_field(R, *lam_by_season[season_seq[n]], Wc, W0, W1)
         q, z = _q_thresholds(R, D, spell_season)
         switch = Z <= z
         R_next = R.copy()
@@ -641,10 +698,11 @@ def simulate_history(
 
     Per-step ("svd") simulator: each day the three latent fields are drawn with
     ``rng.multivariate_normal`` (no burn-in). ``theta`` is the LMC parameter
-    ``(lambda, sigma_wc, sigma_w0, sigma_w1)``.
+    ``(lambda, sigma_wc, sigma_w0, sigma_w1)`` or its state-dependent 5-component
+    form (see :func:`normalize_theta`).
     """
     th = normalize_theta(theta)
-    lam = th["lam"]
+    lam = (th["lam0"], th["lam1"])
     if station_names is None:
         station_names = sorted(list(params_by_station.keys()))
     m = len(station_names)
@@ -944,9 +1002,14 @@ def pairwise_loglik_given_theta(history, params_by_station, theta, eps=1e-15, ve
     )[0]
 
 
-# Default optimiser box: lambda in [0, 1], each range in [1e-3, 5].
+# Default optimiser box (shared-lambda model): lambda in [0, 1], each range in [1e-3, 5].
 THETA_BOUNDS = ((0.0, 1.0), (1e-3, 5.0), (1e-3, 5.0), (1e-3, 5.0))
 THETA_X0 = (0.5, 0.3, 0.3, 0.3)
+
+# State-dependent-lambda variant (Eq. lmc_fields_direct_state_dep):
+# theta = (lambda_0, lambda_1, sigma_wc, sigma_w0, sigma_w1).
+THETA_BOUNDS_STATE_DEP = ((0.0, 1.0), (0.0, 1.0), (1e-3, 5.0), (1e-3, 5.0), (1e-3, 5.0))
+THETA_X0_STATE_DEP = (0.5, 0.5, 0.3, 0.3, 0.3)
 
 
 def mle_theta_pairwise(
@@ -956,7 +1019,9 @@ def mle_theta_pairwise(
     """Maximiser of the pairwise composite likelihood in ``theta``.
 
     Optimises ``theta = (lambda, sigma_wc, sigma_w0, sigma_w1)`` with L-BFGS-B over
-    the box ``bounds``. ``vectorized=True`` evaluates the likelihood with the fast
+    the box ``bounds``. Pass ``bounds=THETA_BOUNDS_STATE_DEP, x0=THETA_X0_STATE_DEP``
+    to fit the 5-parameter state-dependent-lambda variant instead.
+    ``vectorized=True`` evaluates the likelihood with the fast
     :func:`phi2_vec` kernel; the default uses the exact scipy :func:`phi2`.
     """
     def neg_ll(x):
@@ -997,7 +1062,9 @@ def mle_theta_pairwise_histories(
 ):
     """Pairwise-MLE of ``theta`` summing the likelihood across several histories.
 
-    ``vectorized=True`` uses the fast :func:`phi2_vec` kernel.
+    Pass ``bounds=THETA_BOUNDS_STATE_DEP, x0=THETA_X0_STATE_DEP`` to fit the
+    5-parameter state-dependent-lambda variant. ``vectorized=True`` uses the
+    fast :func:`phi2_vec` kernel.
     """
     station_names = histories[0]["station_names"]
 
@@ -1055,17 +1122,22 @@ def run_simulation_mle_experiment(
     inject_nan_frac: float = 0.0,
     nan_seed: int = 123,
     seed_base: int = 0,
-    bounds=THETA_BOUNDS,
-    x0=THETA_X0,
+    bounds=None,
+    x0=None,
     vectorized: bool = False,
     simulator: str = "cholesky",
     n_burn: int = 200,
 ) -> pd.DataFrame:
     """Simulate ``nb_estimations`` spatial histories and fit ``theta`` on each.
 
-    ``theta_true = (lambda, sigma_wc, sigma_w0, sigma_w1)`` is the LMC parameter.
-    Each returned row carries the recovered ``lam_hat, sigma_wc_hat, sigma_w0_hat,
-    sigma_w1_hat`` and ``ll_hat``.
+    ``theta_true = (lambda, sigma_wc, sigma_w0, sigma_w1)`` is the LMC parameter;
+    the 5-component form ``(lambda_0, lambda_1, sigma_wc, sigma_w0, sigma_w1)``
+    selects the state-dependent-lambda variant (see :func:`normalize_theta`).
+    Unless overridden, ``bounds`` / ``x0`` follow the parametrisation of
+    ``theta_true``, so the fitted model matches the simulated one.
+    Each returned row carries the recovered mixing weight(s) (``lam_hat`` for the
+    shared model, ``lam0_hat`` / ``lam1_hat`` for the state-dependent one), the
+    ``sigma_*_hat`` ranges and ``ll_hat``.
 
     ``simulator`` selects how the latent Gaussian fields are drawn:
 
@@ -1077,6 +1149,11 @@ def run_simulation_mle_experiment(
       Kept for the explicit Cholesky-vs-SVD comparison in ``tests_simulation_methods``.
     """
     th_true = normalize_theta(theta_true)
+    shared_lam = "lam" in th_true
+    if bounds is None:
+        bounds = THETA_BOUNDS if shared_lam else THETA_BOUNDS_STATE_DEP
+    if x0 is None:
+        x0 = THETA_X0 if shared_lam else THETA_X0_STATE_DEP
     extract_stations = sorted(list(dict_model_params.keys()))[:nb_stations]
     params_by_station = {c: dict_model_params[c] for c in extract_stations}
     station_names = extract_stations  # already sorted
@@ -1110,15 +1187,20 @@ def run_simulation_mle_experiment(
             history, params_by_station, bounds=bounds, x0=x0, vectorized=vectorized
         )
         th_hat = mle["theta_hat"]
-        rows.append({
-            "i": i,
-            "lam_hat": th_hat["lam"],
+        row = {"i": i}
+        if "lam" in th_hat:
+            row["lam_hat"] = th_hat["lam"]
+        else:
+            row["lam0_hat"] = th_hat["lam0"]
+            row["lam1_hat"] = th_hat["lam1"]
+        row.update({
             "sigma_wc_hat": th_hat["sigma_wc"],
             "sigma_w0_hat": th_hat["sigma_w0"],
             "sigma_w1_hat": th_hat["sigma_w1"],
             "ll_hat": mle["ll_hat"],
             "mean_nb_obs_stations": mle["total_nb_observed_stations"] / nb_steps,
         })
+        rows.append(row)
     df = pd.DataFrame(rows)
     df.attrs["theta_true"] = th_true
     df.attrs["nb_stations"] = nb_stations
