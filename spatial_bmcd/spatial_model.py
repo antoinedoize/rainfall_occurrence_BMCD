@@ -41,23 +41,40 @@ with ``theta = (lambda_0, lambda_1, sigma_wc, sigma_w0, sigma_w1)`` and blocks
 Every function taking ``theta`` accepts both parametrisations (dispatch by
 length/keys, see :func:`normalize_theta`); the shared-lambda model is the
 special case ``lambda_0 = lambda_1``.
+
+**Distance unit.** Inter-station distances ``h`` are great-circle (haversine)
+distances **in kilometres**, computed from the ``lat`` / ``lon`` of each station
+by :func:`station_distance_matrix`. The ranges ``sigma_wc, sigma_w0, sigma_w1``
+are therefore expressed in kilometres too. (Earlier versions used the Euclidean
+distance between coordinates rescaled to the unit square, which made the metric
+anisotropic — lon and lat were divided by different factors — and the ranges
+domain-dependent; fits produced before that change are not comparable.)
+
+**Station selection.** On top of the single-site admissibility of notebook 01,
+the spatial station set drops the stations whose RR record is too incomplete
+over the analysis window, see :func:`filter_stations_by_nan_fraction` and
+``config_spatial.MAX_NAN_FRACTION_STATION``; fits produced before that filter
+rest on a different station set and are not comparable either.
 """
 
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 import scipy.stats
+from haversine import Unit, haversine, haversine_vector
 from scipy.optimize import minimize
 from scipy.special import erf
 from scipy.stats import multivariate_normal, norm
 from tqdm import tqdm
 
 from article_code.util_files import config
+from spatial_bmcd import config_spatial
 from article_code.util_files.data_load import (
     from_date_to_season,
     list_station_files,
@@ -91,7 +108,12 @@ def _make_cdf_fitted_mix_geom_from_params(pi: float, p1: float, p2: float) -> Ca
 
 
 def _normalise_coords(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ``x_norm`` / ``y_norm`` columns in [0, 1] from ``lon`` / ``lat``."""
+    """Add ``x_norm`` / ``y_norm`` columns in [0, 1] from ``lon`` / ``lat``.
+
+    Display only — these drive the scatter maps of ``spatial_plotting`` and
+    ``spatial_diagnostics``. No distance is computed from them: see
+    :func:`station_distance_matrix`.
+    """
     out = df.copy()
     min_lat, max_lat = out["lat"].min(), out["lat"].max()
     min_lon, max_lon = out["lon"].min(), out["lon"].max()
@@ -113,7 +135,9 @@ def build_dict_model_params(
     For every station in ``stations`` (or every common station if ``None``)
     the returned dict holds:
 
-        x_norm, y_norm                 -- normalised coordinates (set externally)
+        lat, lon                       -- station coordinates (degrees), the
+                                          input of :func:`station_distance_matrix`
+        x_norm, y_norm                 -- normalised coordinates, for plotting only
         params_dry = (f_1, xi, sigma, kappa)
         params_wet = (pi, p1, p2)
         q_d_dry_function : callable    -- d -> q^(0)(d), see Eq. (1) of the article
@@ -216,39 +240,79 @@ def prepare_station_fit_table(
 
 
 # ---------------------------------------------------------------------------
-# Spatial Markov step and simulation
+# Inter-station distance (haversine, km) and exponential correlation
 # ---------------------------------------------------------------------------
 
 
-def exponential_cov_func(x_norm1, x_norm2, y_norm1, y_norm2, sigma: float = 0.3):
-    """Exponential covariance ``exp(-d / sigma)`` between normalised coordinates."""
-    d = np.sqrt((x_norm2 - x_norm1) ** 2 + (y_norm2 - y_norm1) ** 2)
-    return np.exp(-d / sigma)
+@lru_cache(maxsize=32)
+def _distance_matrix_from_coords(coords: tuple) -> np.ndarray:
+    """Haversine distance matrix (km) of a hashable ``((lat, lon), ...)`` tuple.
+
+    Cached: the likelihood re-derives the same matrix at every optimiser step.
+    """
+    pts = np.asarray(coords, dtype=float)
+    D = haversine_vector(pts, pts, Unit.KILOMETERS, comb=True)
+    np.fill_diagonal(D, 0.0)   # exact zeros, free of the rounding of the formula
+    D.flags.writeable = False  # the cached array is shared; callers must not edit
+    return D
+
+
+def station_distance_matrix(
+    params_by_station: Dict[str, dict],
+    station_names: Optional[Sequence[str]] = None,
+) -> np.ndarray:
+    """``J x J`` great-circle distance matrix between stations, **in kilometres**.
+
+    Computed with the ``haversine`` package from the ``lat`` / ``lon`` of each
+    station (set by :func:`build_dict_model_params`). This is *the* inter-station
+    distance of the project: the latent correlations ``exp(-h / sigma_k)`` of
+    :func:`build_C_from_sigma` and every distance axis of the diagnostics read it,
+    so the fitted ranges ``sigma_k`` are directly comparable to the values plotted
+    against distance (the latent correlation drops by 1/e at ``h = sigma_k`` km).
+
+    The returned array is read-only (it is shared with an internal cache); call
+    ``.copy()`` on it if you need to modify it in place.
+    """
+    if station_names is None:
+        station_names = sorted(params_by_station.keys())
+    try:
+        coords = tuple(
+            (float(params_by_station[c]["lat"]), float(params_by_station[c]["lon"]))
+            for c in station_names
+        )
+    except KeyError as exc:
+        raise KeyError(
+            "station_distance_matrix needs 'lat' and 'lon' for every station; "
+            f"missing {exc} -- build the parameter dict with build_dict_model_params()"
+        ) from exc
+    return _distance_matrix_from_coords(coords)
+
+
+def exponential_cov_func(lat1, lon1, lat2, lon2, sigma: float = 300.0):
+    """Exponential correlation ``exp(-h / sigma)`` between two points.
+
+    ``h`` is the haversine distance in kilometres, ``sigma`` a range in kilometres.
+    Scalar counterpart of :func:`build_C_from_sigma`.
+    """
+    h = haversine((lat1, lon1), (lat2, lon2), unit=Unit.KILOMETERS)
+    return np.exp(-h / float(sigma))
 
 
 def build_C_from_sigma(
     station_names: Sequence[str],
     params_by_station: Dict[str, dict],
     sigma: float,
+    D: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Build the spatial covariance matrix C from a scalar range parameter ``sigma``."""
-    sigma = float(sigma)
-    return np.array(
-        [
-            [
-                exponential_cov_func(
-                    params_by_station[c1]["x_norm"],
-                    params_by_station[c2]["x_norm"],
-                    params_by_station[c1]["y_norm"],
-                    params_by_station[c2]["y_norm"],
-                    sigma=sigma,
-                )
-                for c1 in station_names
-            ]
-            for c2 in station_names
-        ],
-        dtype=float,
-    )
+    """Spatial correlation matrix ``exp(-h / sigma)`` from a scalar range ``sigma``.
+
+    ``h`` is the haversine distance in km (:func:`station_distance_matrix`) and
+    ``sigma`` a range in km. Pass ``D`` to reuse an already-computed distance
+    matrix for the same ``station_names``.
+    """
+    if D is None:
+        D = station_distance_matrix(params_by_station, station_names)
+    return np.exp(-D / float(sigma))
 
 
 # ---------------------------------------------------------------------------
@@ -317,13 +381,15 @@ def build_field_cov_matrices(
     """The three latent exponential correlation matrices ``rho_wc, rho_w0, rho_w1``.
 
     Each is the ``J x J`` matrix ``exp(-h / sigma_k)`` of the corresponding latent
-    field, reusing :func:`build_C_from_sigma`.
+    field, reusing :func:`build_C_from_sigma`. ``h`` is in km, so the ranges
+    ``sigma_k`` are too. The distance matrix is built once and shared by the three.
     """
     th = normalize_theta(theta)
+    D = station_distance_matrix(params_by_station, station_names)
     return {
-        "wc": build_C_from_sigma(station_names, params_by_station, th["sigma_wc"]),
-        "w0": build_C_from_sigma(station_names, params_by_station, th["sigma_w0"]),
-        "w1": build_C_from_sigma(station_names, params_by_station, th["sigma_w1"]),
+        "wc": build_C_from_sigma(station_names, params_by_station, th["sigma_wc"], D=D),
+        "w0": build_C_from_sigma(station_names, params_by_station, th["sigma_w0"], D=D),
+        "w1": build_C_from_sigma(station_names, params_by_station, th["sigma_w1"], D=D),
     }
 
 
@@ -1002,14 +1068,23 @@ def pairwise_loglik_given_theta(history, params_by_station, theta, eps=1e-15, ve
     )[0]
 
 
-# Default optimiser box (shared-lambda model): lambda in [0, 1], each range in [1e-3, 5].
-THETA_BOUNDS = ((0.0, 1.0), (1e-3, 5.0), (1e-3, 5.0), (1e-3, 5.0))
-THETA_X0 = (0.5, 0.3, 0.3, 0.3)
+# Default optimiser box (shared-lambda model): lambda in [0, 1], each range in
+# [0.1, 5000] KILOMETRES -- the unit of the haversine distance of
+# station_distance_matrix. The upper bound is a few times the diameter of the
+# Spain/Portugal station set (~1220 km): beyond it exp(-h/sigma) is flat over the
+# whole domain and the range stops being identifiable. Widen it for a larger domain.
+SIGMA_BOUNDS_KM = (1e-1, 5.0e3)
+SIGMA_X0_KM = 300.0
+
+THETA_BOUNDS = ((0.0, 1.0), SIGMA_BOUNDS_KM, SIGMA_BOUNDS_KM, SIGMA_BOUNDS_KM)
+THETA_X0 = (0.5, SIGMA_X0_KM, SIGMA_X0_KM, SIGMA_X0_KM)
 
 # State-dependent-lambda variant (Eq. lmc_fields_direct_state_dep):
 # theta = (lambda_0, lambda_1, sigma_wc, sigma_w0, sigma_w1).
-THETA_BOUNDS_STATE_DEP = ((0.0, 1.0), (0.0, 1.0), (1e-3, 5.0), (1e-3, 5.0), (1e-3, 5.0))
-THETA_X0_STATE_DEP = (0.5, 0.5, 0.3, 0.3, 0.3)
+THETA_BOUNDS_STATE_DEP = (
+    (0.0, 1.0), (0.0, 1.0), SIGMA_BOUNDS_KM, SIGMA_BOUNDS_KM, SIGMA_BOUNDS_KM,
+)
+THETA_X0_STATE_DEP = (0.5, 0.5, SIGMA_X0_KM, SIGMA_X0_KM, SIGMA_X0_KM)
 
 
 def mle_theta_pairwise(
@@ -1279,6 +1354,68 @@ def load_all_station_rr(
     if verbose:
         print(f"Finished RR load -- Rejected {nb_rejected} station files")
     return dfs_by_city
+
+
+def station_nan_fraction(
+    dfs_by_city: Dict[str, pd.DataFrame],
+    year_min: int = config_spatial.NAN_FRACTION_YEAR_MIN,
+    year_max: int = config_spatial.NAN_FRACTION_YEAR_MAX,
+    rr_col: str = "RR",
+    date_col: str = "DATE",
+) -> pd.Series:
+    """Fraction of missing RR days of each station over ``[year_min, year_max]``.
+
+    Measured against the *full daily calendar* of the window, as
+    :func:`build_joint_df_occurrence_from_raw_data` does, so that days for
+    which the ECAD file carries no row at all -- a record starting after
+    ``year_min`` or stopping before ``year_max`` -- count as missing. Counting
+    NaNs among the rows present instead would score a station whose record
+    stops in 2005 as perfectly observed.
+    """
+    full_index = pd.date_range(f"{year_min}-01-01", f"{year_max}-12-31", freq="D")
+    fractions = {}
+    for city, df in dfs_by_city.items():
+        rr = df.set_index(pd.to_datetime(df[date_col]))[rr_col]
+        rr = rr[~rr.index.duplicated()]
+        fractions[city] = float(rr.reindex(full_index).isna().mean())
+    return pd.Series(fractions, name="nan_fraction", dtype=float).sort_values()
+
+
+def filter_stations_by_nan_fraction(
+    stations_metadata: pd.DataFrame,
+    dfs_by_city: Dict[str, pd.DataFrame],
+    max_nan_fraction: float = config_spatial.MAX_NAN_FRACTION_STATION,
+    year_min: int = config_spatial.NAN_FRACTION_YEAR_MIN,
+    year_max: int = config_spatial.NAN_FRACTION_YEAR_MAX,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Drop from ``stations_metadata`` the stations that are too incomplete.
+
+    A station is dropped when its :func:`station_nan_fraction` over
+    ``[year_min, year_max]`` exceeds ``max_nan_fraction``. Only the stations
+    present in ``dfs_by_city`` are assessed: a city of ``stations_metadata``
+    whose raw record was not loaded is left in place rather than silently
+    discarded, so that the helper is harmless when the metadata table covers
+    more countries than the analysis does.
+
+    The filter is deliberately global rather than per season: on the
+    Spain--Portugal subset the missing-day fraction varies by at most 8 points
+    across the four seasons, and the seasonal rows of the article's figures
+    must rest on one common station set to be comparable.
+    """
+    fractions = station_nan_fraction(dfs_by_city, year_min, year_max)
+    dropped = fractions[fractions > max_nan_fraction]
+    kept_metadata = stations_metadata[~stations_metadata["city"].isin(dropped.index)]
+    if verbose:
+        print(
+            f"NaN filter ({year_min}-{year_max}, max {max_nan_fraction:.0%} missing): "
+            f"{len(fractions) - len(dropped)}/{len(fractions)} assessed stations kept"
+        )
+        if len(dropped):
+            print("  dropped: " + ", ".join(
+                f"{city} ({frac:.0%})" for city, frac in dropped.items()
+            ))
+    return kept_metadata
 
 
 _MONTH_TO_SEASON = np.array(

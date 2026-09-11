@@ -30,10 +30,17 @@ from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Patch
 from scipy.cluster.hierarchy import leaves_list, linkage
+from scipy.optimize import minimize_scalar
 from scipy.spatial.distance import squareform
+from scipy.stats import norm
 from tqdm import tqdm
 
-from spatial_bmcd.spatial_model import simulate_cholesky
+from spatial_bmcd.spatial_model import (
+    normalize_theta,
+    phi2_vec,
+    simulate_cholesky,
+    station_distance_matrix,
+)
 from spatial_bmcd.spatial_plotting import _ensure_figures_dir
 
 
@@ -41,25 +48,11 @@ from spatial_bmcd.spatial_plotting import _ensure_figures_dir
 # Shared helpers: distances, station ordering, block construction
 # ---------------------------------------------------------------------------
 
-
-def station_distance_matrix(
-    params_by_station: Dict[str, dict],
-    station_names: Optional[Sequence[str]] = None,
-) -> np.ndarray:
-    """J x J Euclidean distance matrix on the normalised coordinates.
-
-    Distances are in the same normalised ``[0, 1]^2`` units as the covariance
-    of the article, hence directly comparable to ``sigma_hat`` (the latent
-    correlation drops by 1/e at distance ``sigma_hat``).
-    """
-    if station_names is None:
-        station_names = sorted(params_by_station.keys())
-    xy = np.array(
-        [[params_by_station[c]["x_norm"], params_by_station[c]["y_norm"]] for c in station_names],
-        dtype=float,
-    )
-    diff = xy[:, None, :] - xy[None, :, :]
-    return np.sqrt((diff ** 2).sum(axis=-1))
+# ``station_distance_matrix`` (haversine, kilometres) is defined in
+# ``spatial_model`` so that the diagnostics' distance axes and the model's own
+# latent correlations exp(-h / sigma_k) read the exact same metric -- the model
+# curves of :func:`lmc_block_curves` are overlaid on those axes. It is re-exported
+# here for the callers that have always imported it from this module.
 
 
 def spatial_station_order(
@@ -118,6 +111,17 @@ def simulate_block_ensemble(
     show_progress: bool = True,
 ) -> List[List[dict]]:
     """Simulate ``n_sims`` replicates of the observed season-block layout.
+
+    .. note::
+       **Superseded for the seasonal fits.** This builds a *stationary* ensemble
+       from a single ``theta``; the multi-season notebooks
+       (``spatial_lin_mod_coregion_fit_spain_portugal.ipynb``) instead simulate
+       replicates with :func:`spatial_model.simulate_cholesky_seasonal`, one
+       ``theta_hat_s`` per season on the real calendar and masked with the
+       observed NaN pattern, then feed the plotting helpers below with
+       ``[blocks_from_Rbin(rep) for rep in reps]``. Prefer that route; see
+       ``NOTES_spatial_diagnostics.md``. This function remains valid for the
+       single-season / stationary studies it was written for.
 
     The fitted model is stationary ("perpetual spring": the season-specific
     exit probabilities and the spatial covariance are time-invariant), while
@@ -784,7 +788,7 @@ def plot_pairwise_stat_vs_distance(
             ax.axvline(sigma_marker, color="grey", ls="--", lw=1)
             ax.text(sigma_marker, ax.get_ylim()[1], r" $\hat\sigma$",
                     va="top", ha="left", color="grey")
-        ax.set_xlabel("inter-station distance (normalised units)")
+        ax.set_xlabel("inter-station distance (km)")
         ax.set_title(stat_labels.get(stat, stat), fontsize=10)
     axes[0][0].legend(fontsize=7, loc="upper right")
     plt.tight_layout()
@@ -890,6 +894,290 @@ def plot_spell_survival_obs_vs_sim(
         ax.set_ylabel(r"P($\tau \geq$ d)")
         ax.set_title(f"{kind} spells (complete, pooled over stations)", fontsize=10)
         ax.legend(fontsize=8)
+    plt.tight_layout()
+    if save:
+        fig.savefig(_ensure_figures_dir() / filename, bbox_inches="tight")
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Switch-dependence diagnostics (main.tex, empirical motivation of the spatial
+# model): per-pair statistics of the transition indicators S, stratified by
+# the current state pair of the two stations
+# ---------------------------------------------------------------------------
+
+# The model's spatial dependence acts on the switch indicators
+# ``S[n, j] = 1{R[n+1, j] != R[n, j]}`` conditionally on the current states, so
+# every statistic below is stratified by the state pair of the two stations:
+_SWITCH_CLASSES = ("dry-dry", "wet-wet", "dry-wet")
+
+
+def _switch_class_labels(rj: np.ndarray, rk: np.ndarray) -> np.ndarray:
+    """State-pair class of each day: dry-dry (0,0), wet-wet (1,1), else dry-wet."""
+    return np.where(
+        (rj == 0) & (rk == 0), "dry-dry",
+        np.where((rj == 1) & (rk == 1), "wet-wet", "dry-wet"),
+    )
+
+
+def exit_prob_matrix(
+    history: dict,
+    params_by_station: Dict[str, dict],
+    clip_q: float = 1e-12,
+) -> np.ndarray:
+    """Fitted exit probabilities ``q[n, j] = q^(R_nj)_{s_j}(D_nj)`` aligned with ``S``.
+
+    Same lookup as ``spatial_model._exit_probs`` (single-site fits treated as
+    known inputs), vectorised over days by caching the per-duration values.
+    Rows where ``R``, ``D`` or ``S`` is NaN at station ``j`` stay NaN.
+    """
+    R, D, S = history["R"], history["D"], history["S"]
+    names = history["station_names"]
+    T = S.shape[0]
+    Q = np.full((T, len(names)), np.nan, dtype=float)
+    for j, name in enumerate(names):
+        funcs = {
+            0: params_by_station[name]["q_d_dry_function"],
+            1: params_by_station[name]["q_d_wet_function"],
+        }
+        Rj, Dj = R[:T, j], D[:T, j]
+        valid = np.isfinite(Rj) & np.isfinite(Dj) & np.isfinite(S[:, j])
+        for r, f in funcs.items():
+            idx = np.flatnonzero(valid & (Rj == r))
+            if idx.size == 0:
+                continue
+            ds = Dj[idx].astype(int)
+            lut = {d: float(f(d)) for d in np.unique(ds)}
+            Q[idx, j] = [lut[d] for d in ds]
+    return np.clip(Q, clip_q, 1.0 - clip_q)
+
+
+def switch_marginal_calibration(
+    histories: List[dict],
+    params_by_station: Dict[str, dict],
+) -> pd.DataFrame:
+    """Per-station ratio (observed switches) / (sum of fitted exit probabilities).
+
+    Sanity check of the single-site fits used to standardise the pairwise
+    statistics: under a well-calibrated marginal model the ratio is ~1 for
+    every station (separately per current state), so any pairwise ratio far
+    from 1 must come from *dependence between* stations, not from the marginals.
+    """
+    names = histories[0]["station_names"]
+    n_sw = np.zeros((2, len(names)))
+    sum_q = np.zeros((2, len(names)))
+    n_days = np.zeros((2, len(names)), dtype=int)
+    for h in histories:
+        Q = exit_prob_matrix(h, params_by_station)
+        T = h["S"].shape[0]
+        R, S = h["R"][:T], h["S"]
+        for r in (0, 1):
+            m = np.isfinite(Q) & (R == r)
+            n_sw[r] += np.where(m, np.nan_to_num(S), 0.0).sum(axis=0)
+            sum_q[r] += np.where(m, Q, 0.0).sum(axis=0)
+            n_days[r] += m.sum(axis=0)
+    rows = []
+    for j, name in enumerate(names):
+        for r, state in ((0, "dry"), (1, "wet")):
+            rows.append({
+                "station": name, "state": state, "n_days": int(n_days[r, j]),
+                "n_switches": int(n_sw[r, j]), "expected_switches": sum_q[r, j],
+                "ratio": n_sw[r, j] / sum_q[r, j] if sum_q[r, j] > 0 else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
+def _pair_class_negloglik(rho, z_j, z_k, s_j, s_k, q_j, q_k, eps: float = 1e-15):
+    """Negative log-likelihood of one pair's switch outcomes on one state class.
+
+    Same four-case bivariate-probit factor as the pairwise composite likelihood
+    (Eq. rho_direct of main.tex, ``pairwise_loglik_one_step_nanaware``), but with
+    a single free correlation ``rho`` instead of the LMC block.
+    """
+    q_joint = phi2_vec(z_j, z_k, rho)
+    p = np.where(
+        s_j & s_k, q_joint,
+        np.where(
+            s_j & ~s_k, q_j - q_joint,
+            np.where(~s_j & s_k, q_k - q_joint, 1.0 - q_j - q_k + q_joint),
+        ),
+    )
+    return -float(np.sum(np.log(np.maximum(p, eps))))
+
+
+def switch_pair_stats(
+    histories: List[dict],
+    params_by_station: Dict[str, dict],
+    min_days_per_class: int = 100,
+    fit_rho: bool = True,
+    show_progress: bool = False,
+) -> pd.DataFrame:
+    """Per-pair, per-state-class dependence statistics of the switch indicators.
+
+    For every station pair (j, k) and every class of ``_SWITCH_CLASSES``
+    (current states of the two stations: both dry, both wet, discordant),
+    pooling the days of all ``histories`` where both stations have valid
+    ``(R, D, S)``:
+
+    - ``ratio_emp`` — *joint-switch ratio with empirical margins*
+      ``mean(S_j S_k) / (mean(S_j) mean(S_k))`` on the class days: observed
+      joint-switch frequency over its value if the two stations switched
+      independently at their observed class rates. Fully model-free; > 1 means
+      positive dependence of the switches, < 1 negative dependence.
+    - ``ratio`` — same numerator standardised by the *fitted single-site
+      marginals*, ``sum_n S_j S_k / sum_n q_j q_k``. Ties the diagnostic to the
+      single-site model (duration-resolved margins) but inherits its marginal
+      calibration bias (cf. :func:`switch_marginal_calibration`), so
+      ``ratio_emp`` is the cleaner stage-1 statistic.
+    - ``rho_hat`` — *per-pair latent correlation*: MLE of the single free
+      correlation of a thresholded bivariate Gaussian, maximising the pair's
+      class-restricted likelihood (:func:`_pair_class_negloglik`). This is the
+      empirical, unconstrained counterpart of the LMC block
+      ``C^(r, r')(s_j, s_k)`` that the spatial model then parametrises.
+
+    Returns a long DataFrame with columns ``station_j, station_k, dist,
+    state_class, n_days, n_sw_j, n_sw_k, n_joint, expected_joint, ratio_emp,
+    ratio, rho_hat``. Classes with fewer than ``min_days_per_class`` jointly
+    valid days are skipped.
+    """
+    names = histories[0]["station_names"]
+    m = len(names)
+    dist = station_distance_matrix(params_by_station, names)
+
+    # Pool the per-day quantities over histories once (T_total x m arrays).
+    Q = np.vstack([exit_prob_matrix(h, params_by_station) for h in histories])
+    S = np.vstack([h["S"] for h in histories])
+    R = np.vstack([h["R"][:h["S"].shape[0]] for h in histories])
+    Z = norm.ppf(Q)
+
+    records = []
+    pairs = [(j, k) for j in range(m - 1) for k in range(j + 1, m)]
+    iterator = tqdm(pairs, desc="switch pair stats") if show_progress else pairs
+    for j, k in iterator:
+        valid = np.isfinite(Q[:, j]) & np.isfinite(Q[:, k])
+        if not np.any(valid):
+            continue
+        rj, rk = R[valid, j].astype(int), R[valid, k].astype(int)
+        sj, sk = S[valid, j].astype(bool), S[valid, k].astype(bool)
+        qj, qk = Q[valid, j], Q[valid, k]
+        zj, zk = Z[valid, j], Z[valid, k]
+        labels = _switch_class_labels(rj, rk)
+        for cls in _SWITCH_CLASSES:
+            sel = labels == cls
+            n = int(sel.sum())
+            if n < min_days_per_class:
+                continue
+            n_sw_j, n_sw_k = int(np.sum(sj[sel])), int(np.sum(sk[sel]))
+            n_joint = int(np.sum(sj[sel] & sk[sel]))
+            expected_joint = float(np.sum(qj[sel] * qk[sel]))
+            rho_hat = np.nan
+            if fit_rho:
+                res = minimize_scalar(
+                    _pair_class_negloglik,
+                    bounds=(-0.999, 0.999),
+                    method="bounded",
+                    args=(zj[sel], zk[sel], sj[sel], sk[sel], qj[sel], qk[sel]),
+                )
+                rho_hat = float(res.x)
+            records.append({
+                "station_j": names[j], "station_k": names[k],
+                "dist": float(dist[j, k]), "state_class": cls, "n_days": n,
+                "n_sw_j": n_sw_j, "n_sw_k": n_sw_k,
+                "n_joint": n_joint, "expected_joint": expected_joint,
+                "ratio_emp": (
+                    n_joint * n / (n_sw_j * n_sw_k)
+                    if n_sw_j > 0 and n_sw_k > 0 else np.nan
+                ),
+                "ratio": n_joint / expected_joint if expected_joint > 0 else np.nan,
+                "rho_hat": rho_hat,
+            })
+    return pd.DataFrame(records)
+
+
+def lmc_block_curves(theta, h: np.ndarray) -> Dict[str, np.ndarray]:
+    """Model-implied LMC covariance blocks ``C^(r, r')`` at distances ``h``.
+
+    The parametric curves (Eq. lmc_blocks_inline of main.tex, exponential latent
+    correlations) that :func:`switch_pair_stats`'s free ``rho_hat`` estimates
+    when the model holds; keys match ``_SWITCH_CLASSES``.
+    """
+    th = normalize_theta(theta)
+    h = np.asarray(h, dtype=float)
+    rho_wc = np.exp(-h / th["sigma_wc"])
+    rho_w0 = np.exp(-h / th["sigma_w0"])
+    rho_w1 = np.exp(-h / th["sigma_w1"])
+    return {
+        "dry-dry": th["lam0"] * rho_wc + (1.0 - th["lam0"]) * rho_w0,
+        "wet-wet": th["lam1"] * rho_wc + (1.0 - th["lam1"]) * rho_w1,
+        "dry-wet": -np.sqrt(th["lam0"] * th["lam1"]) * rho_wc,
+    }
+
+
+def _binned_median_line(ax, df, stat, n_bins, color, label):
+    """Distance-binned median of per-pair values (equal-count bins)."""
+    sub = df[["dist", stat]].dropna()
+    if len(sub) == 0:
+        return
+    edges = np.unique(np.quantile(sub["dist"], np.linspace(0, 1, n_bins + 1)))
+    centers, med = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        vals = sub.loc[(sub["dist"] >= a) & (sub["dist"] <= b), stat]
+        if len(vals) == 0:
+            continue
+        centers.append(0.5 * (a + b))
+        med.append(np.median(vals))
+    ax.plot(centers, med, color=color, lw=1.8, label=label)
+
+
+_SWITCH_STAT_LABELS = {
+    "ratio_emp": "joint switches / expected under independence",
+    "ratio": "joint switches / expected under independence (fitted margins)",
+    "rho_hat": r"per-pair latent correlation $\hat\rho$",
+}
+_SWITCH_STAT_REFLINE = {"ratio_emp": 1.0, "ratio": 1.0, "rho_hat": 0.0}
+
+
+def plot_switch_stat_vs_distance(
+    obs_stats: pd.DataFrame,
+    stat: str = "ratio_emp",
+    sim_stats_list: Optional[List[pd.DataFrame]] = None,
+    theta=None,
+    n_bins: int = 8,
+    save: bool = True,
+    filename: str = "diag_switch_ratio_vs_distance.pdf",
+):
+    """Per-pair switch-dependence statistic vs distance, one panel per state class.
+
+    ``obs_stats`` (and each element of ``sim_stats_list``) is the long DataFrame
+    of :func:`switch_pair_stats`. Observed pairs are black dots with a
+    distance-binned median; ``sim_stats_list`` adds the simulated 2.5-97.5%
+    envelope (same statistic on trajectories simulated from the fitted model);
+    ``theta`` overlays the model-implied LMC block curves of
+    :func:`lmc_block_curves` (meaningful for ``stat="rho_hat"`` only, since the
+    free per-pair correlation is what the blocks parametrise).
+    """
+    fig, axes = plt.subplots(
+        1, len(_SWITCH_CLASSES), figsize=(4.8 * len(_SWITCH_CLASSES), 4.0),
+        squeeze=False, sharey=True,
+    )
+    h_grid = np.linspace(0.0, float(obs_stats["dist"].max()), 200)
+    curves = lmc_block_curves(theta, h_grid) if theta is not None else None
+    for ax, cls in zip(axes[0], _SWITCH_CLASSES):
+        obs_c = obs_stats[obs_stats["state_class"] == cls]
+        if sim_stats_list is not None:
+            sim_c = [df[df["state_class"] == cls] for df in sim_stats_list]
+            _ensemble_band(ax, sim_c, stat, n_bins, "steelblue", "simulated")
+        ax.scatter(obs_c["dist"], obs_c[stat], s=12, color="black", alpha=0.6,
+                   linewidths=0, zorder=3, label="observed (pairs)")
+        _binned_median_line(ax, obs_c, stat, n_bins, "crimson", "observed (binned median)")
+        if curves is not None:
+            ax.plot(h_grid, curves[cls], color="forestgreen", lw=1.6, ls="--",
+                    label=r"model $C^{(r,r')}(h)$ at $\hat\theta$")
+        ax.axhline(_SWITCH_STAT_REFLINE.get(stat, 0.0), color="grey", lw=1, ls=":")
+        ax.set_xlabel("inter-station distance (km)")
+        ax.set_title(f"current states: {cls}", fontsize=10)
+    axes[0][0].set_ylabel(_SWITCH_STAT_LABELS.get(stat, stat))
+    axes[0][0].legend(fontsize=7, loc="upper right")
     plt.tight_layout()
     if save:
         fig.savefig(_ensure_figures_dir() / filename, bbox_inches="tight")

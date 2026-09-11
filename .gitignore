@@ -8,3 +8,7 @@ __pycache__/
 # Local-only archive repo (no remote); kept out of this repo
 spatial_bmcd/archive_Spatial_BMCD_article_and_code/
 
+# Cached replicate ensembles (spatial_bmcd/simulation_cache.py): regenerable
+# from the fitted theta, a few MB per entry
+spatial_bmcd/experiment_outputs/sim_ensemble_cache/
+
